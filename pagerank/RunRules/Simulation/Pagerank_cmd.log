@@ -1,0 +1,420 @@
+Apache Ant version 1.7.1 compiled on August 24 2010
+Buildfile: Pagerank.xml
+Detected Java version: 1.6 in: /usr/lib/jvm/java-1.6.0-openjdk-1.6.0.0.x86_64/jre
+Detected OS: Linux
+parsing buildfile /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/Pagerank.xml with URI = file:/hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/Pagerank.xml
+Project base dir set to: /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode
+[antlib:org.apache.tools.ant] Could not load definitions from resource org/apache/tools/ant/antlib.xml. It could not be found.
+ [property] Loading Environment env.
+Property "-*-command-variables-*-" has not been set
+Property "env.MAXCOMPILERJCP" has not been set
+Build sequence for target(s) `run' is [build, run]
+Complete build sequence is [build, run, help, clean, all, jar, ]
+
+build:
+Detected Java version: 1.6 in: /usr/lib/jvm/java-1.6.0-openjdk-1.6.0.0.x86_64/jre
+Detected OS: Linux
+      [ant] calling target(s) [default] in build file /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/Pagerank_Build.xml
+parsing buildfile /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/Pagerank_Build.xml with URI = file:/hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/Pagerank_Build.xml
+Project base dir set to: /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode
+ [property] Loading Environment env.
+Property "-*-command-variables-*-" has not been set
+Property "env.MAXCOMPILERJCP" has not been set
+      [ant] Entering /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/Pagerank_Build.xml...
+Build sequence for target(s) `all' is [clean, build, all]
+Complete build sequence is [clean, build, all, ]
+
+clean:
+   [delete] Deleting directory /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/ForAllPropRdr.maxj.tmp.canDelete
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/ElemUpdate.maxj.bak.2
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/MemUnit0.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/MemUnit5.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/ForAllPropRdr.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/CoalesceSM.maxj.bak.wrBuf
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/MemUnit.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/UpdQueueSM.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/SinkKernel.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/BVCReader.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/BVNWriter.maxj.bak.2
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/MemUnit1.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/EdgeReader.maxj.bak.3
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/NodeReader.maxj.bak.2
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/EdgeReader.maxj.bak.2
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/BVCReader.maxj.bak.2
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/GraphAccelManager.maxj.bak_rsm
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/ReaderPullSM.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/NbrPropRed.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/MemUnit2.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/CoalesceSM.maxj.bak.3
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/LvlUpdater.maxj.bak.3
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/CoalesceSM.maxj.bak.2
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/LvlUpdater.maxj.bak.2
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/QRdrPktCntSM.maxj.bak.2
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/LvlReader.makj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/NodeReader.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/ReaderSM_Q.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/BVNWriter.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/LvlUpdater.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/ElemUpdate.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/MemUnit3.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/LvlReader.makj.bak.2
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/ReaderSM.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/CoalesceSM.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/prefix_sum.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/PropModSM.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/MemUnit4.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/QRdrPktCntSM.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/EdgeReader.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/LvlReaderCtrlSM.maxj.bak
+   [delete] Deleting directory /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/.MemUnitSM.maxj.swp
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/MemUnitSM.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/ElemUpdate.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/BVCReader.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/QRdrPktCntSM$States.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/QRdrPktCntSM.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/NodeReader.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/LvlReader.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/BVNWriter.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/LvlUpdater.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/CoalesceSM.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/LvlReaderCtrlSM.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/MemUnit.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/NbrQueueSM.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/PropReader.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/NbrPropRed.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/UpdQueueSM.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/UpdQueueSM$States.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/PropReducerPush.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/EndSignal.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/ForAllPropRdr.class
+   [delete] Deleting directory /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/PagerankManager.maxj.bak
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/GC.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/blocks/FifoKernelSM.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/blocks/Scalars.class
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/blocks/ScalarsSM.class
+   [delete] Deleting directory /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/blocks
+   [delete] Deleting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/PagerankManager.class
+   [delete] Deleting directory /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank
+   [delete] Deleting directory /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin
+   [delete] Deleting directory /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist
+
+build:
+    [mkdir] Created dir: /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist
+    [mkdir] Created dir: /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin
+     [copy] pagerank/.GC.maxj.swp added as pagerank/.GC.maxj.swp doesn't exist.
+     [copy] pagerank/PagerankManager.maxj.bak added as pagerank/PagerankManager.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/.MemUnitSM.maxj.swp added as pagerank/kernels/.MemUnitSM.maxj.swp doesn't exist.
+     [copy] pagerank/kernels/bak/BVCReader.maxj.bak added as pagerank/kernels/bak/BVCReader.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/BVCReader.maxj.bak.2 added as pagerank/kernels/bak/BVCReader.maxj.bak.2 doesn't exist.
+     [copy] pagerank/kernels/bak/BVNWriter.maxj.bak added as pagerank/kernels/bak/BVNWriter.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/BVNWriter.maxj.bak.2 added as pagerank/kernels/bak/BVNWriter.maxj.bak.2 doesn't exist.
+     [copy] pagerank/kernels/bak/CoalesceSM.maxj.bak added as pagerank/kernels/bak/CoalesceSM.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/CoalesceSM.maxj.bak.2 added as pagerank/kernels/bak/CoalesceSM.maxj.bak.2 doesn't exist.
+     [copy] pagerank/kernels/bak/CoalesceSM.maxj.bak.3 added as pagerank/kernels/bak/CoalesceSM.maxj.bak.3 doesn't exist.
+     [copy] pagerank/kernels/bak/CoalesceSM.maxj.bak.wrBuf added as pagerank/kernels/bak/CoalesceSM.maxj.bak.wrBuf doesn't exist.
+     [copy] pagerank/kernels/bak/EdgeReader.maxj.bak added as pagerank/kernels/bak/EdgeReader.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/EdgeReader.maxj.bak.2 added as pagerank/kernels/bak/EdgeReader.maxj.bak.2 doesn't exist.
+     [copy] pagerank/kernels/bak/EdgeReader.maxj.bak.3 added as pagerank/kernels/bak/EdgeReader.maxj.bak.3 doesn't exist.
+     [copy] pagerank/kernels/bak/ElemUpdate.maxj.bak added as pagerank/kernels/bak/ElemUpdate.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/ElemUpdate.maxj.bak.2 added as pagerank/kernels/bak/ElemUpdate.maxj.bak.2 doesn't exist.
+     [copy] pagerank/kernels/bak/ForAllPropRdr.maxj.bak added as pagerank/kernels/bak/ForAllPropRdr.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/ForAllPropRdr.maxj.tmp.canDelete added as pagerank/kernels/bak/ForAllPropRdr.maxj.tmp.canDelete doesn't exist.
+     [copy] pagerank/kernels/bak/GraphAccelManager.maxj.bak_rsm added as pagerank/kernels/bak/GraphAccelManager.maxj.bak_rsm doesn't exist.
+     [copy] pagerank/kernels/bak/LvlReader.makj.bak added as pagerank/kernels/bak/LvlReader.makj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/LvlReader.makj.bak.2 added as pagerank/kernels/bak/LvlReader.makj.bak.2 doesn't exist.
+     [copy] pagerank/kernels/bak/LvlReaderCtrlSM.maxj.bak added as pagerank/kernels/bak/LvlReaderCtrlSM.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/LvlUpdater.maxj.bak added as pagerank/kernels/bak/LvlUpdater.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/LvlUpdater.maxj.bak.2 added as pagerank/kernels/bak/LvlUpdater.maxj.bak.2 doesn't exist.
+     [copy] pagerank/kernels/bak/LvlUpdater.maxj.bak.3 added as pagerank/kernels/bak/LvlUpdater.maxj.bak.3 doesn't exist.
+     [copy] pagerank/kernels/bak/MemUnit.maxj.bak added as pagerank/kernels/bak/MemUnit.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/MemUnit0.maxj.bak added as pagerank/kernels/bak/MemUnit0.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/MemUnit1.maxj.bak added as pagerank/kernels/bak/MemUnit1.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/MemUnit2.maxj.bak added as pagerank/kernels/bak/MemUnit2.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/MemUnit3.maxj.bak added as pagerank/kernels/bak/MemUnit3.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/MemUnit4.maxj.bak added as pagerank/kernels/bak/MemUnit4.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/MemUnit5.maxj.bak added as pagerank/kernels/bak/MemUnit5.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/NbrPropRed.maxj.bak added as pagerank/kernels/bak/NbrPropRed.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/NodeReader.maxj.bak added as pagerank/kernels/bak/NodeReader.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/NodeReader.maxj.bak.2 added as pagerank/kernels/bak/NodeReader.maxj.bak.2 doesn't exist.
+     [copy] pagerank/kernels/bak/PropModSM.maxj.bak added as pagerank/kernels/bak/PropModSM.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/QRdrPktCntSM.maxj.bak added as pagerank/kernels/bak/QRdrPktCntSM.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/QRdrPktCntSM.maxj.bak.2 added as pagerank/kernels/bak/QRdrPktCntSM.maxj.bak.2 doesn't exist.
+     [copy] pagerank/kernels/bak/ReaderPullSM.maxj.bak added as pagerank/kernels/bak/ReaderPullSM.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/ReaderSM.maxj.bak added as pagerank/kernels/bak/ReaderSM.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/ReaderSM_Q.maxj.bak added as pagerank/kernels/bak/ReaderSM_Q.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/SinkKernel.maxj.bak added as pagerank/kernels/bak/SinkKernel.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/UpdQueueSM.maxj.bak added as pagerank/kernels/bak/UpdQueueSM.maxj.bak doesn't exist.
+     [copy] pagerank/kernels/bak/prefix_sum.maxj.bak added as pagerank/kernels/bak/prefix_sum.maxj.bak doesn't exist.
+     [copy] Copying 44 files to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/ForAllPropRdr.maxj.tmp.canDelete to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/ForAllPropRdr.maxj.tmp.canDelete
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/ElemUpdate.maxj.bak.2 to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/ElemUpdate.maxj.bak.2
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/MemUnit0.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/MemUnit0.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/MemUnit5.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/MemUnit5.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/.GC.maxj.swp to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/.GC.maxj.swp
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/PagerankManager.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/PagerankManager.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/ForAllPropRdr.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/ForAllPropRdr.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/CoalesceSM.maxj.bak.wrBuf to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/CoalesceSM.maxj.bak.wrBuf
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/MemUnit.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/MemUnit.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/UpdQueueSM.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/UpdQueueSM.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/SinkKernel.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/SinkKernel.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/BVCReader.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/BVCReader.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/BVNWriter.maxj.bak.2 to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/BVNWriter.maxj.bak.2
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/MemUnit1.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/MemUnit1.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/EdgeReader.maxj.bak.3 to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/EdgeReader.maxj.bak.3
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/NodeReader.maxj.bak.2 to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/NodeReader.maxj.bak.2
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/EdgeReader.maxj.bak.2 to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/EdgeReader.maxj.bak.2
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/BVCReader.maxj.bak.2 to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/BVCReader.maxj.bak.2
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/GraphAccelManager.maxj.bak_rsm to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/GraphAccelManager.maxj.bak_rsm
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/ReaderPullSM.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/ReaderPullSM.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/NbrPropRed.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/NbrPropRed.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/MemUnit2.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/MemUnit2.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/CoalesceSM.maxj.bak.3 to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/CoalesceSM.maxj.bak.3
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/LvlUpdater.maxj.bak.3 to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/LvlUpdater.maxj.bak.3
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/CoalesceSM.maxj.bak.2 to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/CoalesceSM.maxj.bak.2
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/LvlUpdater.maxj.bak.2 to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/LvlUpdater.maxj.bak.2
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/QRdrPktCntSM.maxj.bak.2 to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/QRdrPktCntSM.maxj.bak.2
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/LvlReader.makj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/LvlReader.makj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/NodeReader.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/NodeReader.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/ReaderSM_Q.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/ReaderSM_Q.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/BVNWriter.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/BVNWriter.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/LvlUpdater.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/LvlUpdater.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/ElemUpdate.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/ElemUpdate.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/MemUnit3.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/MemUnit3.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/LvlReader.makj.bak.2 to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/LvlReader.makj.bak.2
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/ReaderSM.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/ReaderSM.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/CoalesceSM.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/CoalesceSM.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/prefix_sum.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/prefix_sum.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/.MemUnitSM.maxj.swp to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/.MemUnitSM.maxj.swp
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/PropModSM.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/PropModSM.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/MemUnit4.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/MemUnit4.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/QRdrPktCntSM.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/QRdrPktCntSM.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/EdgeReader.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/EdgeReader.maxj.bak
+     [copy] Copying /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/bak/LvlReaderCtrlSM.maxj.bak to /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin/pagerank/kernels/bak/LvlReaderCtrlSM.maxj.bak
+[maxjcompiler] 
+[maxjcompiler] 
+[maxjcompiler] Compiling to folder /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin
+[maxjcompiler] 
+[maxjcompiler] Compiling files and folders:
+[maxjcompiler] /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src
+[maxjcompiler] 
+[maxjcompiler] Compiler options:
+[maxjcompiler] -noExit
+[maxjcompiler] -classpath
+[maxjcompiler] /opt/maxeler/maxcompiler-2013.2.2/lib/MaxCompiler.jar
+[maxjcompiler] -d
+[maxjcompiler] /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin
+[maxjcompiler] ----------
+[maxjcompiler] 1. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/MemUnitSM.maxj (at line 8)
+[maxjcompiler] 	import com.maxeler.maxcompiler.v2.utils.MathUtils;
+[maxjcompiler] 	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[maxjcompiler] The import com.maxeler.maxcompiler.v2.utils.MathUtils is never used
+[maxjcompiler] ----------
+[maxjcompiler] ----------
+[maxjcompiler] 2. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/ElemUpdate.maxj (at line 13)
+[maxjcompiler] 	import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.memory.Memory;
+[maxjcompiler] 	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[maxjcompiler] The import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.memory.Memory is never used
+[maxjcompiler] ----------
+[maxjcompiler] 3. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/ElemUpdate.maxj (at line 47)
+[maxjcompiler] 	DFEType nbrType    = dfeUInt(GC.edgeWidth);
+[maxjcompiler] 	        ^^^^^^^
+[maxjcompiler] The local variable nbrType is never read
+[maxjcompiler] ----------
+[maxjcompiler] 4. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/ElemUpdate.maxj (at line 60)
+[maxjcompiler] 	DFEType edgeType = dfeUInt(GC.EDGEWIDTH);
+[maxjcompiler] 	        ^^^^^^^^
+[maxjcompiler] The local variable edgeType is never read
+[maxjcompiler] ----------
+[maxjcompiler] ----------
+[maxjcompiler] 5. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/BVCReader.maxj (at line 5)
+[maxjcompiler] 	import com.maxeler.maxcompiler.v2.kernelcompiler.SMIO;
+[maxjcompiler] 	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[maxjcompiler] The import com.maxeler.maxcompiler.v2.kernelcompiler.SMIO is never used
+[maxjcompiler] ----------
+[maxjcompiler] 6. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/BVCReader.maxj (at line 15)
+[maxjcompiler] 	import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Bitops;
+[maxjcompiler] 	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[maxjcompiler] The import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Bitops is never used
+[maxjcompiler] ----------
+[maxjcompiler] 7. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/BVCReader.maxj (at line 18)
+[maxjcompiler] 	import pagerank.blocks.*;
+[maxjcompiler] 	       ^^^^^^^^^^^^^^^
+[maxjcompiler] The import pagerank.blocks is never used
+[maxjcompiler] ----------
+[maxjcompiler] 8. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/BVCReader.maxj (at line 29)
+[maxjcompiler] 	private DFEVar prArb(int width, DFEVar req, DFEVar base) {
+[maxjcompiler] 	               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[maxjcompiler] The method prArb(int, DFEVar, DFEVar) from the type BVCReader is never used locally
+[maxjcompiler] ----------
+[maxjcompiler] 9. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/BVCReader.maxj (at line 114)
+[maxjcompiler] 	DFEVar emitNbrSet = numWinCnt.eq(0); 
+[maxjcompiler] 	       ^^^^^^^^^^
+[maxjcompiler] The local variable emitNbrSet is never read
+[maxjcompiler] ----------
+[maxjcompiler] 10. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/BVCReader.maxj (at line 253)
+[maxjcompiler] 	DFEVar nodeToProc = constant.var(nodeType, 0);
+[maxjcompiler] 	       ^^^^^^^^^^
+[maxjcompiler] The local variable nodeToProc is never read
+[maxjcompiler] ----------
+[maxjcompiler] 11. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/BVCReader.maxj (at line 280)
+[maxjcompiler] 	DFEVar ndNumCtrl = sendNode;
+[maxjcompiler] 	       ^^^^^^^^^
+[maxjcompiler] The local variable ndNumCtrl is never read
+[maxjcompiler] ----------
+[maxjcompiler] ----------
+[maxjcompiler] 12. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/NbrPropRed.maxj (at line 18)
+[maxjcompiler] 	import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Mem.RamWriteMode;
+[maxjcompiler] 	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[maxjcompiler] The import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Mem.RamWriteMode is never used
+[maxjcompiler] ----------
+[maxjcompiler] 13. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/NbrPropRed.maxj (at line 20)
+[maxjcompiler] 	import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+[maxjcompiler] 	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[maxjcompiler] The import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter is never used
+[maxjcompiler] ----------
+[maxjcompiler] 14. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/NbrPropRed.maxj (at line 21)
+[maxjcompiler] 	import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.WrapMode;
+[maxjcompiler] 	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[maxjcompiler] The import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.WrapMode is never used
+[maxjcompiler] ----------
+[maxjcompiler] 15. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/NbrPropRed.maxj (at line 23)
+[maxjcompiler] 	import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Stream.OffsetExpr;
+[maxjcompiler] 	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[maxjcompiler] The import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Stream.OffsetExpr is never used
+[maxjcompiler] ----------
+[maxjcompiler] 16. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/NbrPropRed.maxj (at line 25)
+[maxjcompiler] 	import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Bitops;
+[maxjcompiler] 	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[maxjcompiler] The import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Bitops is never used
+[maxjcompiler] ----------
+[maxjcompiler] 17. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/NbrPropRed.maxj (at line 28)
+[maxjcompiler] 	import pagerank.blocks.*;
+[maxjcompiler] 	       ^^^^^^^^^^^^^^^
+[maxjcompiler] The import pagerank.blocks is never used
+[maxjcompiler] ----------
+[maxjcompiler] 18. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/NbrPropRed.maxj (at line 29)
+[maxjcompiler] 	import com.maxeler.maxcompiler.v2.utils.MathUtils;
+[maxjcompiler] 	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[maxjcompiler] The import com.maxeler.maxcompiler.v2.utils.MathUtils is never used
+[maxjcompiler] ----------
+[maxjcompiler] 19. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/NbrPropRed.maxj (at line 36)
+[maxjcompiler] 	private DFEVar prArb(int width, DFEVar req, DFEVar base) {
+[maxjcompiler] 	               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[maxjcompiler] The method prArb(int, DFEVar, DFEVar) from the type NbrPropRed is never used locally
+[maxjcompiler] ----------
+[maxjcompiler] ----------
+[maxjcompiler] 20. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/UpdQueueSM.maxj (at line 241)
+[maxjcompiler] 	DFEsmValue resultIn = nodeResIn[propWidth-1:0];
+[maxjcompiler] 	           ^^^^^^^^
+[maxjcompiler] The local variable resultIn is never read
+[maxjcompiler] ----------
+[maxjcompiler] 21. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/UpdQueueSM.maxj (at line 443)
+[maxjcompiler] 	DFEsmValue nodeDAddr = nodeD[GC.nodeWidth-1:GC.pPBBits];
+[maxjcompiler] 	           ^^^^^^^^^
+[maxjcompiler] The local variable nodeDAddr is never read
+[maxjcompiler] ----------
+[maxjcompiler] ----------
+[maxjcompiler] 22. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/EndSignal.maxj (at line 37)
+[maxjcompiler] 	DFEArray<DFEVar> dummyArray = dummyArray_In.data;
+[maxjcompiler] 	                 ^^^^^^^^^^
+[maxjcompiler] The local variable dummyArray is never read
+[maxjcompiler] ----------
+[maxjcompiler] ----------
+[maxjcompiler] 23. WARNING in /hd/kunle/users/tayo/mdx_workspace/pagerank/EngineCode/src/pagerank/kernels/ForAllPropRdr.maxj (at line 88)
+[maxjcompiler] 	Memory <DFEVar> [] nodeFifos = new Memory[arSize];
+[maxjcompiler] 	                               ^^^^^^^^^^^^^^^^^^
+[maxjcompiler] Type safety: The expression of type Memory[] needs unchecked conversion to conform to Memory<DFEVar>[]
+[maxjcompiler] ----------
+[maxjcompiler] 23 problems (23 warnings)
+
+all:
+      [ant] Exiting /hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/Pagerank_Build.xml.
+
+run:
+     [java] Executing '/usr/lib/jvm/java-1.6.0-openjdk-1.6.0.0.x86_64/jre/bin/java' with arguments:
+     [java] '-Xmx2048m'
+     [java] '-classpath'
+     [java] '/hd/kunle/users/tayo/mdx_workspace/pagerank/RunRules/Simulation/dist/bin:/opt/maxeler/maxcompiler-2013.2.2/lib/MaxCompiler.jar'
+     [java] 'pagerank.PagerankManager'
+     [java] 
+     [java] The ' characters around the executable and arguments are
+     [java] not part of the command.
+     [java] Setting environment variable: MAXSOURCEDIRS=src
+     [java] Mon 00:26: MaxCompiler version: 2013.2.2
+     [java] Mon 00:26: Build "Pagerank" start time: Mon Sep 15 00:26:41 PDT 2014
+     [java] Mon 00:26: Main build process running as user tayo on host max-2.Stanford.EDU
+     [java] Mon 00:26: Build location: /space/tayo/build/15-09-14/Pagerank_MAX3424A_DFE_SIM
+     [java] Mon 00:26: Detailed build log available in "_build.log"
+     [java] Mon 00:26: 
+     [java] Mon 00:26: ENGINE BUILD PARAMETERS
+     [java] Mon 00:26: 	 Build name: Pagerank_MAX3424A_DFE_SIM
+     [java] Mon 00:26: 	   DFEModel: MAX3424A                 
+     [java] Mon 00:26: 	maxFileName: Pagerank                 
+     [java] Mon 00:26: 	     target: DFE_SIM                  
+     [java] Mon 00:26: 	 enableMPCX: false                    
+     [java] Mon 00:26: Instantiating kernel "ForAllPropRdr0"
+     [java] Mon 00:26: Instantiating kernel "NbrPropRed0"
+     [java] Mon 00:26: Instantiating kernel "ElemUpd0"
+     [java] Mon 00:26: Instantiating kernel "EndSignal0"
+     [java] Mon 00:26: Instantiating kernel "MemUnit0"
+     [java] Mon 00:26: Instantiating kernel "MemUnit1"
+     [java] Mon 00:26: Instantiating kernel "MemUnit2"
+     [java] Mon 00:26: Instantiating kernel "MemUnit3"
+     [java] Mon 00:26: Instantiating kernel "MemUnit4"
+     [java] Mon 00:26: 
+     [java] Mon 00:26: Compiling kernel "ForAllPropRdr0"
+     [java] Mon 00:26: WARNING: Warning (UNCONNECTED_DESIGN_ELEMENT):
+     [java] Mon 00:26: WARNING: Unconnected elements in design 'ForAllPropRdr0'
+     [java] Mon 00:26: WARNING: details in : /space/tayo/build/15-09-14/Pagerank_MAX3424A_DFE_SIM/scratch/ForAllPropRdr0_graph_warnings.txt
+     [java] Mon 00:26: 
+     [java] Mon 00:26: Compiling kernel "NbrPropRed0"
+     [java] Mon 00:26: WARNING: Warning (UNCONNECTED_DESIGN_ELEMENT):
+     [java] Mon 00:26: WARNING: Unconnected elements in design 'NbrPropRed0'
+     [java] Mon 00:26: WARNING: details in : /space/tayo/build/15-09-14/Pagerank_MAX3424A_DFE_SIM/scratch/NbrPropRed0_graph_warnings.txt
+     [java] Mon 00:26: 
+     [java] Mon 00:26: Compiling kernel "ElemUpd0"
+     [java] Mon 00:26: WARNING: Warning (UNCONNECTED_DESIGN_ELEMENT):
+     [java] Mon 00:26: WARNING: Unconnected elements in design 'ElemUpd0'
+     [java] Mon 00:26: WARNING: details in : /space/tayo/build/15-09-14/Pagerank_MAX3424A_DFE_SIM/scratch/ElemUpd0_graph_warnings.txt
+     [java] Mon 00:26: 
+     [java] Mon 00:26: Compiling kernel "EndSignal0"
+     [java] Mon 00:26: WARNING: Warning (UNCONNECTED_DESIGN_ELEMENT):
+     [java] Mon 00:26: WARNING: Unconnected elements in design 'EndSignal0'
+     [java] Mon 00:26: WARNING: details in : /space/tayo/build/15-09-14/Pagerank_MAX3424A_DFE_SIM/scratch/EndSignal0_graph_warnings.txt
+     [java] Mon 00:26: 
+     [java] Mon 00:26: Compiling kernel "MemUnit0"
+     [java] Mon 00:26: WARNING: Warning (UNCONNECTED_DESIGN_ELEMENT):
+     [java] Mon 00:26: WARNING: Unconnected elements in design 'MemUnit0'
+     [java] Mon 00:26: WARNING: details in : /space/tayo/build/15-09-14/Pagerank_MAX3424A_DFE_SIM/scratch/MemUnit0_graph_warnings.txt
+     [java] Mon 00:26: 
+     [java] Mon 00:26: Compiling kernel "MemUnit1"
+     [java] Mon 00:26: WARNING: Warning (UNCONNECTED_DESIGN_ELEMENT):
+     [java] Mon 00:26: WARNING: Unconnected elements in design 'MemUnit1'
+     [java] Mon 00:26: WARNING: details in : /space/tayo/build/15-09-14/Pagerank_MAX3424A_DFE_SIM/scratch/MemUnit1_graph_warnings.txt
+     [java] Mon 00:26: 
+     [java] Mon 00:26: Compiling kernel "MemUnit2"
+     [java] Mon 00:26: WARNING: Warning (UNCONNECTED_DESIGN_ELEMENT):
+     [java] Mon 00:26: WARNING: Unconnected elements in design 'MemUnit2'
+     [java] Mon 00:26: WARNING: details in : /space/tayo/build/15-09-14/Pagerank_MAX3424A_DFE_SIM/scratch/MemUnit2_graph_warnings.txt
+     [java] Mon 00:26: 
+     [java] Mon 00:26: Compiling kernel "MemUnit3"
+     [java] Mon 00:26: WARNING: Warning (UNCONNECTED_DESIGN_ELEMENT):
+     [java] Mon 00:26: WARNING: Unconnected elements in design 'MemUnit3'
+     [java] Mon 00:26: WARNING: details in : /space/tayo/build/15-09-14/Pagerank_MAX3424A_DFE_SIM/scratch/MemUnit3_graph_warnings.txt
+     [java] Mon 00:26: 
+     [java] Mon 00:26: Compiling kernel "MemUnit4"
+     [java] Mon 00:26: WARNING: Warning (UNCONNECTED_DESIGN_ELEMENT):
+     [java] Mon 00:26: WARNING: Unconnected elements in design 'MemUnit4'
+     [java] Mon 00:26: WARNING: details in : /space/tayo/build/15-09-14/Pagerank_MAX3424A_DFE_SIM/scratch/MemUnit4_graph_warnings.txt
+     [java] Mon 00:26: Running back-end simulation build (3 phases)
+     [java] Mon 00:26: (1/3) - Prepare MaxFile Data (GenerateMaxFileDataFile)
+     [java] Mon 00:26: (2/3) - Compile Simulation Modules (SimCompilePass)
+     [java] Mon 00:28: (3/3) - Generate MaxFile (AddSimObjectToMaxFilePass)
+     [java] Mon 00:28: MaxFile: /space/tayo/build/15-09-14/Pagerank_MAX3424A_DFE_SIM/results/Pagerank.max (MD5Sum: b355d79a00ee80d79fc6bfc0c5112b5d)
+     [java] Mon 00:28: Build completed: Mon Sep 15 00:28:02 PDT 2014 (took 1 min, 21 secs)
+
+BUILD SUCCESSFUL
+Total time: 1 minute 24 seconds

@@ -1,0 +1,72 @@
+package pagerank.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.LMemCommandStream;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Accumulator;
+import com.maxeler.maxcompiler.v2.kernelcompiler.SMIO;
+import pagerank.GC;
+
+public class MemUnit extends Kernel {
+
+  public MemUnit(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(32);
+    // Enable flag -- turns the kernel on/off
+    DFEVar en = io.scalarInput("en", dfeBool());
+
+    DFEVar memReq = io.input("memReq", dfeRawBits(GC.memReqWidth));
+    DFEVar req_en = memReq.slice(0).cast(dfeBool());
+    DFEVar req_brst_addr = memReq.slice(1, GC.brstNbits).cast(dfeUInt(GC.brstNbits));
+    DFEVar req_size = memReq.slice(GC.brstNbits+1, GC.sizeBits).cast(dfeUInt(GC.sizeBits));
+
+    // Interrupt signalling final memory request: Addr = 1<<27, Size=255
+    DFEVar interrupt_tag = req_brst_addr.eq(1<<27) & req_size.eq(1);
+
+    // Accumulator -- count the number of bursts requested by this MemUnit.
+    //             -- used for debug purposes and for bandwidth calculations
+    DFEType uint32Type = dfeUInt(32);
+    DFEVar size32 = req_size.cast(uint32Type);
+    DFEVar buf32 = constant.var(dfeUInt(32),0);
+    Accumulator.Params aP = Reductions.accumulator.makeAccumulatorConfig(uint32Type)
+      .withEnable(req_en & en);
+    DFEVar numBrsts = Reductions.accumulator.makeAccumulator(size32, aP);
+    io.scalarOutput("numBrsts", (buf32#numBrsts).cast(dfeUInt(64)), dfeUInt(64));
+
+
+    // State Machine
+    // Issues multiple requests if the number of bursts requested is greater
+    // than 255
+    SMIO muSM = addStateMachine("MemUnitSM",
+                                new MemUnitSM(this, 512));
+    muSM.connectInput("reqCtrl", req_en);
+    muSM.connectInput("reqAddr", req_brst_addr);
+    muSM.connectInput("reqSize", req_size);
+    DFEVar reqCtrl = muSM.getOutput("reqCtrlOut");
+    DFEVar reqAddr = muSM.getOutput("reqAddrOut");
+    DFEVar reqSize = muSM.getOutput("reqSizeOut");
+
+
+    LMemCommandStream.makeKernelOutput
+      ("cmd",                           // stream name
+       reqCtrl & en,                    // ctrl
+       reqAddr,                         // addr (burst number)
+       reqSize,                         // size
+       constant.var(dfeUInt(7), 1),     // inc
+       constant.var(dfeUInt(4), 0),     // stream
+       interrupt_tag);                  // tag
+
+    // debug
+    debug.printf(reqCtrl, parameters.getName());
+    debug.printf(reqCtrl, "\n");
+    debug.printf(reqCtrl, "cnt=%d, req_en=%d, en=%d, burst_addr=%d, size=%d\n", 
+                  cnt, reqCtrl, en, reqAddr, reqSize);
+    debug.printf(interrupt_tag & req_en & en, 
+                 "------------------ INTERRUPT ------------------\n");
+
+    flush.onTrigger(constant.var(false));
+  }
+}

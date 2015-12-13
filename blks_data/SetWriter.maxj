@@ -1,0 +1,297 @@
+package bfs_rep_u.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.IO.*;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Stream.OffsetExpr;
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+import bfs_rep_u.GC;
+
+/*
+ * BVNWriter: Stores the next frontier set for processing
+ */   
+
+public class BVNWriter extends Kernel {
+
+  private void printArray(DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf("%x ", ar[size-1-i]); 
+    }
+  }
+
+  public BVNWriter(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(64);
+    // Scalar Inputs
+    DFEVar BV_Addr    = io.scalarInput("BV_Addr", dfeUInt(GC.scalWidth));
+    DFEVar dbgStopCnt = io.scalarInput("StopCnt", dfeUInt(64));
+    DFEVar uDVal      = io.scalarInput("uDVal"  , dfeUInt(GC.scalWidth));
+
+
+    // Inputs from LvlUpd
+    int nbrsInWidth = GC.coalesceAddrWidth+GC.PROPPERBRST;
+    NonBlockingInput<DFEVar> nbrs_Input =
+      io.nonBlockingInput("updNbrs", dfeRawBits(nbrsInWidth), 
+                          constant.var(true), 1, DelimiterMode.FRAME_LENGTH, 
+                          0, NonBlockingMode.NO_TRICKLING);
+    DFEVar nbrsBase   = nbrs_Input.data.slice(GC.PROPPERBRST,
+                                                    GC.coalesceAddrWidth);;
+    int buf_base = 32 - GC.coalesceAddrWidth;
+    int nbrSetsWidth = GC.NBRSETSWIDTH;
+    DFEVar nbrsBase32 = constant.var(dfeRawBits(buf_base),0) # nbrsBase;
+    DFEVar updNbrsBitVec = nbrs_Input.data.slice(0, GC.PROPPERBRST);
+    DFEVar updNbrsCtrl   = nbrs_Input.valid;
+
+
+    // Calculating frontier done and global done
+    NonBlockingInput<DFEVar> edgeRdrD_In =
+      io.nonBlockingInput("edgeRdrIdle", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+      // counter to ensure that the "done" signal is stable
+      Count.Params edgeDParams = control.count.makeParams(32)
+        .withEnable(edgeRdrD_In.valid & edgeRdrD_In.data)
+        .withReset(edgeRdrD_In.valid & ~edgeRdrD_In.data);
+      DFEVar edgeDCnt = (control.count.makeCounter(edgeDParams)).getCount();
+      DFEVar edgeDVal = edgeDCnt.eq(uDVal);
+    DFEVar edgeRdrD = Reductions.streamHold(edgeDVal, 
+                                            edgeDVal | (edgeRdrD_In.valid & ~edgeRdrD_In.data),
+                                            dfeBool().encodeConstant(false));
+    // Use counter based system to ensure that inputs are stable
+    //DFEVar edgeRdrD = Reductions.streamHold(edgeRdrD_In.data, edgeRdrD_In.valid,
+    //                                        dfeBool().encodeConstant(false));
+
+
+    NonBlockingInput<DFEVar> lvlRdrD_In =
+      io.nonBlockingInput("lvlRdrIdle", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+      // counter to ensure that the "done" signal is stable
+      Count.Params lvlDParams = control.count.makeParams(32)
+        .withEnable(lvlRdrD_In.valid & lvlRdrD_In.data)
+        .withReset(lvlRdrD_In.valid & ~lvlRdrD_In.data);
+      DFEVar lvlDCnt = (control.count.makeCounter(lvlDParams)).getCount();
+      DFEVar lvlDVal = lvlDCnt.eq(uDVal);
+    DFEVar lvlRdrD = Reductions.streamHold(lvlDVal, 
+                                           lvlDVal | (lvlRdrD_In.valid & ~lvlRdrD_In.data),
+                                           dfeBool().encodeConstant(false));
+    //DFEVar lvlRdrD = Reductions.streamHold(lvlRdrD_In.data, lvlRdrD_In.valid,
+    //                                       dfeBool().encodeConstant(false));
+
+    NonBlockingInput<DFEVar> lvlUpdD_In =
+      io.nonBlockingInput("lvlUpdIdle", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+      // counter to ensure that the "done" signal is stable
+      Count.Params updDParams = control.count.makeParams(32)
+        .withEnable(lvlUpdD_In.valid & lvlUpdD_In.data)
+        .withReset(lvlUpdD_In.valid & ~lvlUpdD_In.data);
+      DFEVar updDCnt = (control.count.makeCounter(updDParams)).getCount();
+      DFEVar updDVal = updDCnt.eq(uDVal);
+    DFEVar lvlUpdD = Reductions.streamHold(updDVal, 
+                                           updDVal | (lvlUpdD_In.valid & ~lvlUpdD_In.data),
+                                           dfeBool().encodeConstant(false));
+    //DFEVar lvlUpdD = Reductions.streamHold(lvlUpdD_In.data, lvlUpdD_In.valid,
+    //                                       dfeBool().encodeConstant(false));
+
+    // If unitsDone, emit enough packets to complete the current burst
+    DFEVar unitsD = edgeRdrD & lvlRdrD & lvlUpdD;
+
+    // Saturating counter -- only declare done after unitsD high for a large
+    // number of cycles
+    Count.Params uDCParams = control.count.makeParams(32)
+      .withEnable(unitsD)
+      .withReset(~unitsD);
+    DFEVar uDCnt = (control.count.makeCounter(uDCParams)).getCount();
+    DFEVar uDFull = uDCnt.eq(uDVal);
+    // signal for resetting unitsDone
+    DFEVar uDEndVal = uDVal*2;
+    DFEVar uDEnd    = uDCnt.eq(uDEndVal);
+    /***/
+    DFEVar unitsDone = Reductions.streamHold(uDFull , uDFull|uDEnd, 
+                                  dfeBool().encodeConstant(false));
+    /***/
+    DFEVar unitsDPrev = stream.offset(unitsDone, -1);
+    DFEVar donePulse = unitsDone & ~unitsDPrev;
+    DFEVar resetPulse = ~unitsDone & unitsDPrev;
+
+
+
+
+    // Counter to track number of nodes in packet
+    int arSize = GC.PKTWIDTH/nbrSetsWidth;
+    int pktPlaceBits = MathUtils.bitsToAddress(arSize);
+    Count.Params pktPlaceCntParams = control.count.makeParams(pktPlaceBits)
+        .withMax(arSize) //unnecessary
+        .withReset(resetPulse)
+        //.withReset(unitsDone)
+        .withEnable(updNbrsCtrl);
+    Counter pktPlaceCounter = control.count.makeCounter(pktPlaceCntParams);
+    DFEVar pktPlaceCnt = pktPlaceCounter.getCount();
+
+    // Counter to track number of packets in burst
+OffsetExpr notSentLoopLen = stream.makeOffsetAutoLoop("notSentLoopLen");
+DFEVar notSent = dfeBool().newInstance(this);
+    DFEVar sendPkt = pktPlaceCounter.getWrap() | unitsDone;
+    ////
+    Count.Params pktCntParams = control.count.makeParams(GC.pktsPBBits)
+        .withReset(resetPulse)
+        //.withReset(~notSent)
+        .withEnable(sendPkt & notSent);
+    Counter pktCounter = control.count.makeCounter(pktCntParams);
+    DFEVar pktCnt = pktCounter.getCount();
+
+    // Counter for tracking updated neighbor sets in this frontier
+    int setsWidth = GC.nbrSetsCntBits;
+    DFEType nbrSetsCntType = dfeUInt(setsWidth);
+    Count.Params nbrCntParams = control.count.makeParams(setsWidth)
+        .withReset(unitsDone & pktCounter.getWrap())
+        //.withReset(resetPulse)
+        .withEnable(updNbrsCtrl);
+    DFEVar nbrSetsCnt = (control.count.makeCounter(nbrCntParams)).getCount();
+
+    // todo: emptySet can be driven by incoming brstCnt = 0
+    DFEVar emptySet = Reductions.streamHold( nbrSetsCnt.eq(0) ,
+                                             ~unitsDone ,
+                                             dfeBool().encodeConstant(true) );
+
+    // Protocol for determining end of execution
+    DFEVar nbrSetsCntPrev = stream.offset(nbrSetsCnt, -1);
+    DFEVar validDone = nbrSetsCntPrev>0 | (nbrSetsCntPrev.eq(0) & emptySet);
+    // finish sending remaining packets then assert BVNdone
+    DFEVar BVNdone = unitsDone & pktCounter.getWrap() & validDone;
+
+    DFEVar notBeenSent = Reductions.streamHold(~unitsDone ,
+        ( BVNdone | resetPulse ) ,
+        dfeBool().encodeConstant(true) );
+notSent <== stream.offset(notBeenSent, -notSentLoopLen);
+
+
+    // latch setsCnt for sending to BVCReader
+    DFEVar numElems = Reductions.streamHold(nbrSetsCnt+1, 
+                                    updNbrsCtrl, // unitsD & ~(pktCounter.getWrap())
+                                    nbrSetsCntType.encodeConstant(0));
+
+    // Remove use of emptySet ==> this ends execution after every iteration
+    DFEVar endSignal = /*emptySet &*/ donePulse ; 
+
+    // Counter tracking number of bursts written
+    int brstCntbits = GC.brstNbits;
+    Count.Params brstCntParams = control.count.makeParams(brstCntbits)
+        .withReset(resetPulse)
+        //.withReset(unitsDone)
+        .withEnable(pktCounter.getWrap());
+    DFEVar brstCnt = (control.count.makeCounter(brstCntParams)).getCount();
+
+    // Define BV_N array type for storing next frontier set
+    DFEType nbrSetsType = dfeRawBits(nbrSetsWidth);
+    //DFEType nbrSetsType = dfeRawBits(nbrSetsWidth);
+    DFEArrayType<DFEVar> arrayType = new DFEArrayType<DFEVar>(nbrSetsType, arSize);
+    DFEArray<DFEVar> arrayOut = arrayType.newInstance(this);
+    DFEVar[] thisElem = new DFEVar[arSize];
+    for (int i = 0; i < arSize; i++) {
+      thisElem[i] = pktPlaceCnt.eq(i) & updNbrsCtrl;
+      arrayOut[i] <== Reductions.streamHold(nbrsBase32 # updNbrsBitVec,
+                                            thisElem[i]);
+    }
+
+    // Emit write request when starting a new burst
+    DFEType reqAddrType = dfeUInt(GC.brstNbits);
+    DFEType reqSizeType = dfeUInt(GC.sizeBits);
+    DFEVar baseAddr = BV_Addr.cast(reqAddrType); //removed BVC/BVN mux
+    DFEVar req_brst_addr = baseAddr + brstCnt;
+    DFEVar req_size = constant.var(reqSizeType, 1);
+    DFEVar req_en = updNbrsCtrl & pktPlaceCnt.eq(0) & pktCnt.eq(0); 
+    io.output("memReq", req_size#req_brst_addr#req_en, dfeRawBits(GC.memReqWidth));
+
+    // Emit data packet to memory when: 
+    //   1) when packet is full (sendPkt) or 
+    //   2) when end of frontier: send current packet then enough additional 
+    //      packets to complete the brst (send until notBeenSent==0)
+    //      - Important: Use notBeenSent to prevent extra packets from being
+    //      sent after BVNDone
+    //      - Corner Case: do not send packets if burst request was never issued
+    //      [this happens if numElems is a multiple of nbrSetsPerBurst. request
+    //      issued upon first nbrSet in the burst (pktCnt=0, placeCnt=0)]
+    //        - Note: In this case, notBeenSent will be asserted and the pktCounter
+    //        will continue to increment
+    DFEVar brstPlace = nbrSetsCntPrev.slice(0, GC.nsPBBits);
+    DFEVar firstBurstElem = brstPlace.eq(0);
+    DFEVar storePkt = unitsDone ? 
+                        ~firstBurstElem & 
+                        //during last pkt (ctr wrap), notBeenSent gets de-asserted
+                        (notBeenSent | (pktCounter.getWrap() & validDone)) 
+                      : sendPkt;
+    io.output("bvnArray", arrayOut, arrayType, storePkt);
+
+    // Output: Metadata for BV_N sent to BVCReader
+    //io.output("nbrSetsCnt", numElems, nbrSetsCntType, BVNdone);
+    io.output("endSignal", endSignal|cnt.eq(dbgStopCnt), dfeBool(), 
+              endSignal|cnt.eq(dbgStopCnt)); //BVNdone will not be asserted at endSignal
+
+    // Debug: Scalar Outputs
+    int buf_numElems = GC.scalWidth - GC.nbrSetsCntBits;
+    DFEVar numElemsScal = constant.var(dfeUInt(buf_numElems),0)#numElems;
+    io.scalarOutput("scalarOutNsCnt", numElemsScal.cast(dfeUInt(GC.scalWidth)), 
+                                       dfeUInt(GC.scalWidth));
+    DFEVar outAddrs = arrayOut[7].slice(64,8) # arrayOut[6].slice(64,8) #
+                      arrayOut[5].slice(64,8) # arrayOut[4].slice(64,8) #
+                      arrayOut[3].slice(64,8) # arrayOut[2].slice(64,8) #
+                      arrayOut[1].slice(64,8) # arrayOut[0].slice(64,8);
+    DFEVar oA = Reductions.streamHold(outAddrs, storePkt, 
+                                      dfeRawBits(64).encodeConstant(0));
+    io.scalarOutput("scalarOut_addrs", oA.cast(dfeUInt(64)), dfeUInt(64));
+
+
+    
+    /*
+    // Scalar Outputs -- Debug
+    DFEVar sentBVNdone = Reductions.streamHold(BVNdone, BVNdone,
+                                               dfeBool().encodeConstant(false));
+    DFEVar pktCtrWrapped = Reductions.streamHold(pktCounter.getWrap(),
+                                                 pktCounter.getWrap(),
+                                                 dfeBool().encodeConstant(false));
+    DFEVar sawValidDone = Reductions.streamHold(validDone, validDone,
+                                                dfeBool().encodeConstant(false));
+    DFEVar sawUnitsD = Reductions.streamHold(unitsDone, unitsDone,
+                                             dfeBool().encodeConstant(false));
+    DFEVar sawLvlRdrD = Reductions.streamHold(lvlRdrD, lvlRdrD,
+                                             dfeBool().encodeConstant(false));
+    DFEVar nbrSetsAtDone = Reductions.streamHold(numElems, BVNdone,
+                                                 dfeUInt(16).encodeConstant(0));
+    //io.scalarOutput("scalarOut_0", sawUnitsD,    dfeBool());
+    //io.scalarOutput("scalarOut_1", sentBVNdone,  dfeBool());
+    //io.scalarOutput("scalarOut_", pktCtrWrapped, dfeBool());
+    //io.scalarOutput("scalarOut_", edgeRdrD,        dfeBool());
+    //io.scalarOutput("scalarOut_0", sawLvlRdrD,  dfeBool());
+    //io.scalarOutput("scalarOut_1", lvlUpdD,  dfeBool());
+    //io.scalarOutput("scalarOut_", sawValidDone,  dfeBool());
+    //io.scalarOutput("scalarOut_2", nbrSetsAtDone, dfeUInt(16));
+    */
+
+    // Debug
+    debug.printf("BVNWriter: cnt=%d, nbrsCnt=%d, nbrsCtrl=%d, nbrsBase=%d [%o]\n", 
+      cnt, nbrSetsCnt, updNbrsCtrl, nbrsBase, updNbrsBitVec);
+    //debug.printf("    Done: bvcRd=%d,edgeRd=%d,lvlRd=%d,lvlUpd=%d(val=%d, data=%d),unitsD=%d,numE=%d\n",
+    debug.printf("    Done: edgeRd=%d(cnt=%d),lvlRd=%d(cnt=%d),lvlUpd=%d(cnt=%d),unitsD=%d,unitsDone=%d\n",
+      edgeRdrD, edgeDCnt, lvlRdrD, lvlDCnt, lvlUpdD, updDCnt, unitsD, unitsDone);
+    debug.printf("    pktPlaceCnt=%d, pktCnt=%d, brstCnt=%d, uDCnt=%d, uDFull=%d\n", 
+      pktPlaceCnt, pktCnt, brstCnt, uDCnt, uDFull);
+    debug.printf("    sendPkt=%d, notBeenSent=%d, storePkt=%d, notSent=%d, emptySet=%d, endSignal=%d\n", 
+      sendPkt, notBeenSent, storePkt, notSent, emptySet, endSignal);
+    debug.printf("    BVNdone=%d, brstCnt=%d, req_en=%d, req_brst_addr=%d, req_size=%d\n", 
+      BVNdone, brstCnt, req_en, req_brst_addr, req_size);
+    debug.printf("    arrayOut = ");
+      printArray(arrayOut.elementsAsArray(), arSize); debug.printf("\n");
+    //debug.printf("    prefix sum: ");
+    //for (int i = GC.PROPPERBRST-1; i >= 0; i--) 
+    //  debug.printf("%d ", x0[i]);
+    //debug.printf("\n");
+
+    flush.onTrigger(constant.var(false));
+  }
+}

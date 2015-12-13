@@ -1,0 +1,82 @@
+package pagerank.blocks;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelLib;
+import com.maxeler.maxcompiler.v2.statemachine.kernel.KernelStateMachine;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmInput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmOutput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateValue;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.buffer.DFEsmFifo;
+//import com.maxeler.maxcompiler.v2.statemachine.stdlib.Buffer;
+import com.maxeler.maxcompiler.v2.statemachine.types.DFEsmValueType;
+
+public class FifoKernelSM extends KernelStateMachine {
+
+  DFEsmFifo dataFifo;
+  //Buffer.DFEsmFifoConfig dataFifoCfg;
+
+  // I/O
+  private final DFEsmInput  dataIn;
+  private final DFEsmInput  dataVal;
+  private final DFEsmInput  readEn;
+  private final DFEsmOutput dataOut;
+  private final DFEsmOutput dataRdy;
+
+  private final DFEsmStateValue dataAvail;
+
+  public FifoKernelSM(KernelLib owner, int dataWidth, int dataDepth) {                                           
+    super(owner);                                                                                                
+    DFEsmValueType dataType = dfeUInt(dataWidth); 
+    dataFifo = buffer.fifo(dataType, dataDepth);
+
+    dataIn = io.input("dataIn", dataType);
+    dataVal = io.input("dataVal", dfeBool());
+    readEn = io.input("readEn", dfeBool());
+    dataOut = io.output("dataOut", dataType);
+    dataRdy = io.output("dataRdy", dfeBool());
+
+    dataAvail = state.value(dfeBool(), false);
+  }
+
+  @Override
+  protected void nextState() {
+    dataAvail.next <== dataAvail;
+
+    IF (dataFifo.input.full) {
+      debug.printf("  --Full-fifo..\n");
+    }
+
+    dataFifo.input.dataIn <== dataIn;
+    dataFifo.input.writeEnable <== dataVal;
+    //dataFifo.input.writeEnable <== dataVal & ~readEn;
+
+    IF (~dataAvail & dataVal)
+      dataFifo.output.readEnable <== 1;
+    ELSE
+      dataFifo.output.readEnable <== readEn;
+
+    IF (~ dataFifo.output.empty) { // <-- for this FIFO, "empty" could mean one datum 
+      dataAvail.next <== 1;        //   
+    }
+    ELSE IF (dataAvail) {          // <-- empty & dataAvail: exactly one element in the FIFO
+      IF (dataVal)
+        dataAvail.next <== 1;
+      ELSE IF (readEn)
+        dataAvail.next <== 0;
+    }
+    ELSE {                        // <-- empty & ~dataAvail: nothing in the FIFO
+      IF (dataVal)
+        dataAvail.next <== 1;     // <-- empty fifo is read and written simult
+      ELSE IF (readEn)
+        dataAvail.next <== 0;
+    }
+  }
+
+  @Override
+  protected void outputFunction() {
+    //debug.printf("SM: dataOut=%d, rdEn=%d, dataVal=%d, empty=%d, dataAvail=%d\n", 
+    //             dataFifo.output.dataOut, readEn, dataFifo.output.valid, 
+    //             dataFifo.output.empty, dataAvail);
+    dataOut <== dataFifo.output.dataOut;
+    dataRdy <== dataAvail;
+  }
+}
+

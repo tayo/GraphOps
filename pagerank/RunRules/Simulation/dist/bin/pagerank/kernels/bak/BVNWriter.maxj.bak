@@ -1,0 +1,227 @@
+package graph_accel.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.IO.*;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Stream.OffsetExpr;
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+import graph_accel.GC;
+
+/*
+ * BVNWriter: Stores the next frontier set for processing
+ * # Keep a counter of the number of nbrNums that come in
+ *   - this gets sent back to BVCReader when finished
+ * # Keep a counter which goes up to arSize that tells where to install the
+ *   current nbrNum
+ *     # DFEArray.newInstance()
+ *     # for loop ()
+ * # Keep a counter that tracks which burst address to write to (a.k.a. how many
+ *   bursts have been written so far)
+
+ * - Keep a "mode" bit that tells if current address is BV_N or BV_C
+ *     - Polarity changes when there is a change in lvl
+
+ * # Options for tracking packets within bursts:
+ *   1)#Instantiate one packet.
+ *     #Send memory command at the instantation of a new burst (pktCnt = 0).
+ *     #Send packets whenever they are ready (every arSize nbrNum inputs)
+ *     #At the end of execution, send enough packets to complete the last burst
+ *   2) Instantiate PktsPerBurst packets
+ *      Use counter to count up to arSize*PktsPerBurst and send them all when
+ *      counter reaches the full burst
+ */   
+
+public class BVNWriter extends Kernel {
+
+  private void printArray(DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf("%d ", ar[size-1-i]); 
+    }
+  }
+
+  public BVNWriter(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(32);
+    // Scalar Inputs
+    DFEVar BV_CAddr = io.scalarInput("BV_CAddr", dfeUInt(GC.scalWidth));
+    DFEVar BV_NAddr = io.scalarInput("BV_NAddr", dfeUInt(GC.scalWidth));
+      DFEVar dbgStopCnt = io.scalarInput("StopCnt", dfeUInt(32));
+    // Inputs from BVCReader
+      //DFEVar bvMode = io.input("bvMode", dfeBool());
+    NonBlockingInput<DFEVar> bvMode_Input =
+      io.nonBlockingInput("bvMode", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar bvMode = Reductions.streamHold(bvMode_Input.data, bvMode_Input.valid,
+                                          dfeBool().encodeConstant(true));
+
+    // Inputs from LvlUpd
+    DFEType edgeType = dfeUInt(GC.EDGEWIDTH);
+      //DFEVar nbrCtrl = io.input("updNbrCtrl", dfeBool());
+      //DFEVar nbr_In   = io.input("updNbr"    , edgeType, nbrCtrl);
+    NonBlockingInput<DFEVar> nbr_Input =
+      io.nonBlockingInput("updNbr", edgeType, constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar nbr_In  = nbr_Input.data;
+    DFEVar nbrCtrl = nbr_Input.valid;
+
+    // Calculating frontier done and global done
+      //DFEVar bvcRdrD  = io.input("bvcRdrDone", dfeBool());
+    /*
+    NonBlockingInput<DFEVar> bvcRdrD_In =
+      io.nonBlockingInput("bvcRdrDone", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar bvcRdrD = Reductions.streamHold(bvcRdrD_In.data, bvcRdrD_In.valid,
+                                           dfeBool().encodeConstant(false));
+    */
+
+      //DFEVar edgeRdrD = io.input("edgeRdrIdle", dfeBool());
+    NonBlockingInput<DFEVar> edgeRdrD_In =
+      io.nonBlockingInput("edgeRdrIdle", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar edgeRdrD = Reductions.streamHold(edgeRdrD_In.data, edgeRdrD_In.valid,
+                                            dfeBool().encodeConstant(false));
+
+      //DFEVar lvlRdrD  = io.input("lvlRdrIdle", dfeBool());
+    NonBlockingInput<DFEVar> lvlRdrD_In =
+      io.nonBlockingInput("lvlRdrIdle", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar lvlRdrD = Reductions.streamHold(lvlRdrD_In.data, lvlRdrD_In.valid,
+                                           dfeBool().encodeConstant(false));
+
+      //DFEVar lvlUpdD  = io.input("lvlUpdIdle", dfeBool());
+    NonBlockingInput<DFEVar> lvlUpdD_In =
+      io.nonBlockingInput("lvlUpdIdle", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar lvlUpdD = Reductions.streamHold(lvlUpdD_In.data, lvlUpdD_In.valid,
+                                           dfeBool().encodeConstant(false));
+
+    DFEVar unitsD = /*bvcRdrD & */ edgeRdrD & lvlRdrD & lvlUpdD & ~nbrCtrl;
+    // If unitsDone, emit enough packets to complete the current burst
+
+    // Counter to track number of nodes in packet
+    int arSize = GC.NODESPERPKT;
+    int pktPlaceBits = MathUtils.bitsToAddress(arSize);
+    Count.Params pktPlaceCntParams = control.count.makeParams(pktPlaceBits)
+        .withReset(unitsD)
+        .withEnable(nbrCtrl);
+    Counter pktPlaceCounter = control.count.makeCounter(pktPlaceCntParams);
+    DFEVar pktPlaceCnt = pktPlaceCounter.getCount();
+
+    // Counter to track number of packets in burst
+  OffsetExpr notSentLoopLen = stream.makeOffsetAutoLoop("notSentLoopLen");
+  DFEVar notSent = dfeBool().newInstance(this);
+    DFEVar sendPkt = pktPlaceCounter.getWrap() | unitsD ;
+    ////
+    Count.Params pktCntParams = control.count.makeParams(GC.pktsPBBits)
+        .withReset(~notSent)
+        .withEnable(sendPkt & notSent);
+    Counter pktCounter = control.count.makeCounter(pktCntParams);
+    DFEVar pktCnt = pktCounter.getCount();
+    ////
+    // Counter for tracking updated neighbors in this frontier
+    int nbrCntWidth = GC.bvCntBits;  // max 4G nodes per frontier..?
+    DFEType bvCntType = dfeUInt(nbrCntWidth);
+    Count.Params nbrCntParams = control.count.makeParams(nbrCntWidth)
+        .withReset(unitsD & pktCounter.getWrap())
+        .withEnable(nbrCtrl);
+    DFEVar nbrCnt = (control.count.makeCounter(nbrCntParams)).getCount();
+    // latch bvCnt for sending to BVCReader
+    DFEVar numElems = Reductions.streamHold(nbrCnt+1, 
+                                    nbrCtrl/*unitsD & ~(pktCounter.getWrap())*/,
+                                    bvCntType.encodeConstant(0));
+    DFEVar emptySet = Reductions.streamHold( nbrCnt.eq(0) ,
+                                             ~unitsD ,
+                                             dfeBool().encodeConstant(true) );
+
+    // Protocol for determining end of execution
+    DFEVar nbrCntPrev = stream.offset(nbrCnt, -1);
+    DFEVar validDone = nbrCntPrev>0 | (nbrCntPrev.eq(0) & emptySet);
+    DFEVar BVNdone = unitsD & pktCounter.getWrap() & validDone;
+    DFEVar endSignal = unitsD & pktCounter.getWrap() & emptySet; //(numElems>0);
+
+    //TODO: Need a protocol for resetting notBeenSent
+    //      pktPlaceCnt.eq(1) may not be robust enough
+    DFEVar notBeenSent = Reductions.streamHold(~unitsD ,
+        ( BVNdone | pktPlaceCnt.eq(1) ) ,
+        dfeBool().encodeConstant(true) );
+  notSent <== stream.offset(notBeenSent, -notSentLoopLen);
+
+
+    // Counter tracking number of bursts written
+    int brstCntbits = GC.brstNbits;
+    Count.Params brstCntParams = control.count.makeParams(brstCntbits)
+        .withReset(unitsD)
+        //.withReset(nbrCnt.eq(0) & nbrCtrl)
+        .withEnable(pktCounter.getWrap());
+    DFEVar brstCnt = (control.count.makeCounter(brstCntParams)).getCount();
+
+    // Cast nbr_In type to node type
+    DFEType nodeType = dfeUInt(GC.NODEWIDTH);
+    DFEVar nbr    = nbr_In.cast(nodeType);
+
+    // Define BV_N array type for storing next frontier set
+    DFEArrayType<DFEVar> arrayType = new DFEArrayType<DFEVar>(nodeType, arSize);
+    DFEArray<DFEVar> arrayOut = arrayType.newInstance(this);
+    DFEVar[] thisElem = new DFEVar[arSize];
+    for (int i = 0; i < arSize; i++) {
+      thisElem[i] = pktPlaceCnt.eq(i) & nbrCtrl;
+      arrayOut[i] <== Reductions.streamHold(nbr_In, thisElem[i]);
+    }
+
+    // Emit write request when starting a new burst
+    DFEType reqAddrType = dfeUInt(GC.brstNbits);
+    DFEType reqSizeType = dfeUInt(GC.sizeBits);
+    DFEVar bvc = BV_CAddr.cast(reqAddrType);
+    DFEVar bvn = BV_NAddr.cast(reqAddrType);
+    DFEVar baseAddr = bvMode ? bvc : bvn;
+    DFEVar req_brst_addr = baseAddr + brstCnt;
+    DFEVar req_size = constant.var(reqSizeType, 1);
+    DFEVar req_en = nbrCtrl & pktPlaceCnt.eq(0) & pktCnt.eq(0);
+    io.output("memReq", req_size#req_brst_addr#req_en, dfeRawBits(GC.memReqWidth));
+      //io.output("req_brst_addr", req_brst_addr, reqAddrType);
+      //io.output("req_size"     , req_size     , reqSizeType);
+      //io.output("req_en"       , req_en /*BVNdone*/ , dfeBool());
+
+    // Emit data packet to memory when: 
+    //   1) when packet is full (sendPkt) or 
+    //   2) when end of frontier: send current packet then enough additional 
+    //      packets to complete the brst (send until notBeenSent==0)
+    // Important: Use notBeenSent to prevent extra packets from being sent after
+    // BVNDone
+    DFEVar storePkt = unitsD ? notBeenSent|(pktCounter.getWrap() & validDone)
+                             : sendPkt;
+    io.output("bvnArray", arrayOut, arrayType, storePkt);
+
+	//DFEVar dbgStop = cnt.eq(1100);
+    // Output: Metadata for BV_N sent to BVCReader
+    io.output("bvCnt",     numElems  , bvCntType, BVNdone);
+      //io.output("BVNdone",   BVNdone   , dfeBool(), BVNdone);
+    //io.output("endSignal", endSignal, dfeBool(), BVNdone);
+    io.output("endSignal", endSignal|cnt.eq(dbgStopCnt), dfeBool(), 
+              BVNdone|cnt.eq(dbgStopCnt));
+    
+    // Debug
+    debug.printf("BVNWriter: cnt=%d, nbrCnt=%d, nbrCtrl=%d, nbrCntPrev=%d\n", 
+      cnt, nbrCnt, nbrCtrl, nbrCntPrev);
+    debug.printf("    curNbr=%d, pktPlaceCnt=%d, pktCnt=%d, brstCnt=%d\n", 
+      nbr, pktPlaceCnt, pktCnt, brstCnt);
+    //debug.printf("    Done: bvcRd=%d,edgeRd=%d,lvlRd=%d,lvlUpd=%d(val=%d, data=%d),unitsD=%d,numE=%d\n",
+    debug.printf("    Done: bvcRd=n/a,edgeRd=%d,lvlRd=%d,lvlUpd=%d,unitsD=%d,numE=%d\n",
+      /*bvcRdrD,*/edgeRdrD, lvlRdrD, lvlUpdD, unitsD, numElems);
+    debug.printf("    sendPkt=%d, notBeenSent=%d, storePkt=%d, notSent=%d, emptySet=%d, endSignal=%d\n", 
+      sendPkt, notBeenSent, storePkt, notSent, emptySet, endSignal);
+    debug.printf("    BVNdone=%d, bvMode=%d, brstCnt=%d, req_en=%d, req_brst_addr=%d, req_size=%d\n", 
+      BVNdone, bvMode, brstCnt, req_en, req_brst_addr, req_size);
+    debug.printf("    arrayOut = ");
+      printArray(arrayOut.elementsAsArray(), arSize); debug.printf("\n");
+
+    flush.onTrigger(constant.var(false));
+  }
+}

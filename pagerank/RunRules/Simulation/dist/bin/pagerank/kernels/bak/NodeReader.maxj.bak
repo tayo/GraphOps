@@ -1,0 +1,59 @@
+package graph_accel.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import graph_accel.GC;
+//import graph_accel.blocks.*;
+
+public class NodeReader extends Kernel {
+
+  public NodeReader(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(32);
+
+    DFEType nodeType = dfeUInt(GC.NODEWIDTH);
+    DFEVar ndNumCtrl = io.input("ndNumCtrl", dfeBool());
+    DFEVar ndNum     = io.input("ndNum", nodeType, ndNumCtrl);
+    //DFEVar ndNum     = constant.var(nodeType, 0);
+    //DFEVar ndNumCtrl = constant.var(false);
+
+    // TODO: Root node insertion
+    // Start the BFS by inserting root node when cnt==1
+    int root = 3;
+    DFEVar node     = cnt.eq(1) ? constant.var(nodeType, root) : ndNum;
+    DFEVar nodeCtrl = cnt.eq(1) ? constant.var(true)           : ndNumCtrl;
+
+    // Outputs to EdgeReader
+    //   elems to read within that burst: 8 bits (max 256 elems per burst)
+    DFEVar elemIdx = (node.slice(0, GC.nPBBits)).cast(dfeUInt(GC.nPBBits));
+    io.output("elemIdxCtrl", nodeCtrl, dfeBool());
+    io.output("elemIdx"    , elemIdx  , dfeUInt(GC.nPBBits), nodeCtrl);
+
+    // Outputs to MemUnit: emit read request per valid incoming node
+    DFEVar req_brst_addr = node.slice(GC.nPBBits, GC.brstNbits).cast(dfeUInt(GC.brstNbits));
+    int lastNodeInBrstIdx = GC.NODESPERBRST-1;
+    DFEVar lastNodeInBrst = elemIdx.eq(lastNodeInBrstIdx);
+    DFEVar req_size = lastNodeInBrst?  constant.var(dfeUInt(GC.sizeBits), 2) : 
+                        constant.var(dfeUInt(GC.sizeBits) , 1);
+    DFEVar req_en = nodeCtrl;
+    // assume nodeAddrBase = 0
+    io.output("req_brst_addr", req_brst_addr, dfeUInt(GC.brstNbits));
+    io.output("req_size"     , req_size, dfeUInt(GC.sizeBits));
+    io.output("req_en"       , req_en, dfeBool());
+
+    // debug
+    debug.printf("NodeReader: cnt=%d, ndNum=%d, elemIdx=%d, ndNumCtrl=%d, node=%d, nodeCtrl=%d\n", 
+      cnt, ndNum, elemIdx, ndNumCtrl, node, nodeCtrl);
+    debug.printf("    req_brst_addr=%d, req_en=%d\n", req_brst_addr, req_en);
+    //debug.printf(cnt.eq(0), "cnt=0, numNodes=%d\n", GC.scal.numNodes);
+
+    cnt.watch("cnt"); // watch seems necessary to get debug.printf to show up...
+    //req_brst_addr.watch("req_brst_addr");
+    //req_size.watch("req_size");
+    //req_en.watch("req_en");
+
+    flush.onTrigger(constant.var(false));
+  }
+}

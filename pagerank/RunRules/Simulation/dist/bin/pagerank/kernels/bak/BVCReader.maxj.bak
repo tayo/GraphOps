@@ -1,0 +1,254 @@
+package graph_accel.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.SMIO;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Stream.OffsetExpr;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.IO.*;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Bitops;
+//import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.memory.Memory;
+import graph_accel.GC;
+import graph_accel.blocks.*;
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+
+/*
+ * BVCReader: Reads from the frontier set and sends values to NodeReader for
+ * processing
+ */
+
+public class BVCReader extends Kernel {
+
+  private void printArray(DFEVar ctrl, DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf(ctrl, "%d ", ar[size-1-i]); 
+    }
+  }
+
+  /* //X
+  // return value is used as select control of mux
+  private DFEVar prArb(int width, DFEVar req, DFEVar base) {
+    DFEVar doubleReq = (req # req).cast(dfeUInt(2*width));
+    DFEVar diff = doubleReq - base.cast(dfeUInt(2*width));
+    DFEVar doubleGrant = doubleReq & ~diff;
+    DFEVar grant = doubleGrant.slice(0, width) | doubleGrant.slice(width, width);
+    return grant; // return value can be RawBits, so no need to cast
+  }
+  */
+
+  public BVCReader(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(32);
+    // Scalar Inputs
+    DFEVar BV_CAddr = io.scalarInput("BV_CAddr", dfeUInt(GC.scalWidth));
+    DFEVar BV_NAddr = io.scalarInput("BV_NAddr", dfeUInt(GC.scalWidth));
+
+    // Inputs from memory (frontier elements)
+    DFEType nodeType = dfeUInt(GC.NODEWIDTH);
+    int arSize = GC.NODESPERPKT;
+    DFEArrayType<DFEVar> arrayType = 
+      new DFEArrayType<DFEVar>(nodeType, GC.NODESPERPKT);
+    //DFEArray<DFEVar> bvcArray = io.input("bvcArray", arrayType);
+    //DFEVar bvcArrayCtrl = io.input("bvcArrayCtrl", dfeBool());
+    //DFEArray<DFEVar> bvcArray = io.input("bvcArray", arrayType, bvcArrayCtrl);
+
+    NonBlockingInput<DFEArray<DFEVar>> bvcArray = io.nonBlockingInput("bvcArray", arrayType, constant.var(true), 
+                       1, DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar bvcArrayCtrl = bvcArray.valid;
+
+      /*
+    // Inputs from BVNWriter
+      // Use delay to account for feedback loop
+      int delay=200;
+      DFEVar BVNdone_In = io.input("BVNdone", dfeBool(), cnt>delay);
+        io.pushInputRegistering(false);
+        DFEVar endSignal_In = io.input("endSignal", dfeBool(), cnt>delay);
+        io.popInputRegistering();
+      DFEVar BVNdone = cnt<=delay ? constant.var(false) : BVNdone_In;
+      DFEVar bvCnt_In   = io.input("bvCnt", bvCntType, cnt>delay); 
+      DFEVar bvCnt   = cnt<=delay ? constant.var(bvCntType, 0) : bvCnt_In;
+      DFEVar endSignal = cnt<=delay ? constant.var(false) : endSignal_In;
+      */
+    DFEType bvCntType = dfeUInt(GC.bvCntBits);
+    //NonBlockingInput<DFEVar> bvCnt_In =
+    //  io.nonBlockingInput("bvCnt", bvCntType, constant.var(true), 1, 
+    //                      DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    NonBlockingInput<DFEVar> BVNdone_In =
+      io.nonBlockingInput("BVNdone", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    NonBlockingInput<DFEVar> endSignal_In =
+      io.nonBlockingInput("endSignal", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar BVNdone   = BVNdone_In.valid ? BVNdone_In.data : constant.var(false);
+    //DFEVar BVNdone   = bvCnt_In.valid;
+    //DFEVar bvCnt     = bvCnt_In.valid ? bvCnt_In.data : constant.var(bvCntType, 0);
+    DFEVar bvCnt     = constant.var(bvCntType, 0);
+    DFEVar endSignal = endSignal_In.valid ? endSignal_In.data : constant.var(false);
+
+
+    // register the incoming frontier size
+    DFEVar numElems = Reductions.streamHold(bvCnt, BVNdone,
+                                            bvCntType.encodeConstant(0));
+    int endBrstWidth = GC.bvCntBits-GC.nPBBits;
+    DFEVar endBrst = numElems.slice(GC.nPBBits, endBrstWidth).cast(dfeUInt(endBrstWidth));
+    DFEVar endPkt  = numElems.slice(GC.nPPBits, GC.pktsPBBits).cast(dfeUInt(GC.pktsPBBits));
+
+    // Counter to track number of packets
+    Count.Params pktCntParams = control.count.makeParams(GC.pktsPBBits)
+        .withEnable(bvcArrayCtrl);
+    Counter pktCounter = control.count.makeCounter(pktCntParams);
+    DFEVar pktCnt = pktCounter.getCount();
+    // Counter tracking number of bursts arrived
+    int brstCntbits = endBrstWidth;
+    Count.Params brstCntParams = control.count.makeParams(brstCntbits)
+        .withReset(BVNdone)
+        .withEnable(pktCounter.getWrap());
+    DFEVar brstCnt = (control.count.makeCounter(brstCntParams)).getCount();
+
+    SMIO [] bvFifo = new SMIO[arSize];
+    DFEVar[] pktMask = new DFEVar[arSize];
+    DFEVar[] lastPktVal = new DFEVar[arSize];
+    DFEVar numElemsIdx = numElems.slice(0, GC.nPPBits).cast(dfeUInt(GC.nPPBits));
+    DFEVar goodBrst = brstCnt <= endBrst;
+    DFEVar goodPkt  = bvcArrayCtrl & ((brstCnt < endBrst)|(pktCnt <= endPkt));
+    DFEVar lastPkt  = bvcArrayCtrl & brstCnt.eq(endBrst) & pktCnt.eq(endPkt);
+    DFEVar notLastPkt = goodBrst & goodPkt & ~lastPkt;
+
+    OffsetExpr bvElemLoopLen = stream.makeOffsetAutoLoop("bvElemLoopLen");
+    //XDFEVar bvElemRdEn = dfeRawBits(arSize).newInstance(this);
+      DFEVar bvElemRdEn2 = dfeUInt(arSize).newInstance(this);
+    DFEVar[] bvElemOutputs = new DFEVar[arSize];
+    DFEArrayType<DFEVar> boolArray =
+      new DFEArrayType<DFEVar>(dfeBool(), arSize);
+    DFEArray<DFEVar> bvElemAvail = boolArray.newInstance(this);
+    DFEVar nodeToSend = nodeType.newInstance(this);
+
+    int fifoWidth = GC.NODEWIDTH;
+    int fifoDepth = 512;
+    for (int i = 0; i < arSize; i++) {
+      lastPktVal[i] = lastPkt & (i < numElemsIdx);
+      pktMask[i] = notLastPkt | lastPktVal[i];
+      // FIFOs to store frontier read from memory
+      bvFifo[i] = addStateMachine("bvFifo"+i,
+                                  new FifoKernelSM(this, fifoWidth, fifoDepth));
+      bvFifo[i].connectInput("dataIn", bvcArray.data[i]);
+      bvFifo[i].connectInput("dataVal", pktMask[i]);
+      //XbvFifo[i].connectInput("readEn", bvElemRdEn.slice(i).cast(dfeBool()));
+      bvFifo[i].connectInput("readEn", bvElemRdEn2.slice(i).cast(dfeBool()));
+      bvElemOutputs[i] = bvFifo[i].getOutput("dataOut");
+      bvElemAvail[i] <== bvFifo[i].getOutput("dataRdy");
+    }
+
+    //DFEVar tmpBaseCnt = control.count.simpleCounter(GC.nPPBits);
+    //XDFEVar arbBaseCnt = constant.var(dfeUInt(arSize), 1) << tmpBaseCnt;
+    DFEVar arbReq = bvElemAvail.pack();
+
+    //TODO: Use a 1-bit counter (with BVNdone enable) for mode
+    OffsetExpr modeLoopLen = stream.makeOffsetAutoLoop("modeLoopLen");
+    DFEVar prevMode = dfeBool().newInstance(this);
+    DFEVar bvMode = Reductions.streamHold(~prevMode , BVNdone, 
+                                        dfeBool().encodeConstant(true) );
+    prevMode <== stream.offset(bvMode, -modeLoopLen);
+
+    //XbvElemRdEn <== prArb(arSize, stream.offset(arbReq, -bvElemLoopLen), arbBaseCnt);
+      DFEVar arbReqFixed = arbReq.cast(dfeUInt(arSize));
+      bvElemRdEn2 <== Bitops.leading1Detect(stream.offset(arbReqFixed, -bvElemLoopLen)); 
+    //XnodeToSend <== control.oneHotMux(bvElemRdEn, bvElemOutputs);
+    //XDFEVar sendElem = (arbReq & bvElemRdEn).cast(dfeUInt(arSize)) > 0;
+    nodeToSend <== control.oneHotMux(bvElemRdEn2, bvElemOutputs);
+    DFEVar sendElem = (arbReq & bvElemRdEn2).cast(dfeUInt(arSize)) > 0;
+
+    // Scheme: request N (or brstInc) bursts at a time.  req_en asserted if
+    // current brstCnt is on the (N-1)st of the N bursts and numElems is greater
+    // than the end of the Nth burst
+    int brstInc = 2; //brst grp size
+    int brstIncBits = MathUtils.bitsToAddress(brstInc);
+    DFEVar elemsSoFar = (brstCnt << GC.nPBBits).cast(bvCntType);
+    DFEVar brstNumInGrp = brstCnt.slice(0,brstIncBits).cast(dfeUInt(brstIncBits));
+    DFEVar almostDone = brstNumInGrp.eq(brstInc-1); //last brst in grp
+    DFEVar moreToRd = numElems > (elemsSoFar + GC.NODESPERBRST);
+    DFEVar reqMore = almostDone & moreToRd & (bvcArrayCtrl & pktCnt.eq(0));
+
+    DFEVar reqStart = BVNdone & (bvCnt > 0);
+
+    // Counter: curLvl is an n-bit counter, with BVNdone enable
+    Count.Params curLvlCntParams = control.count.makeParams(GC.PROPWIDTH)
+        .withEnable(BVNdone);
+    DFEVar curLvlCnt = (control.count.makeCounter(curLvlCntParams)).getCount();
+    // Determine when to send done signal
+    //DFEVar BVCdone = begunProc & ~sendElem;
+    //DFEVar BVCdone = constant.var(true);
+      //DFEVar begunProc = Reductions.streamHold(bvcArrayCtrl , 
+      //    bvcArrayCtrl | (~moreToRd & pktCnt.eq(GC.PKTSPERBRST-1) & ~bvcArrayCtrl),
+      //    dfeBool().encodeConstant(false));
+      //DFEVar BVCdone = Reductions.streamHold(~BVNdone , 
+      //                                       BVNdone | (begunProc & ~sendElem),
+      //                                       dfeBool().encodeConstant(true));
+
+    // Outputs to NodeReader
+    DFEVar ndNumCtrl = sendElem;
+      //io.output("ndNumCtrl", sendElem    , dfeBool());
+    io.output("ndNum"    , nodeToSend  , nodeType, ndNumCtrl);
+    // Outputs to LvlUpdater
+    io.output("curLvl", curLvlCnt, dfeUInt(GC.PROPWIDTH), sendElem);
+    // Outputs to BVN_Writer
+    io.output("bvMode", bvMode, dfeBool(), sendElem);
+      //io.output("bvcRdrDone", BVCdone, dfeBool(), BVCdone);
+    // Outputs to MemUnit
+    DFEType reqAddrType = dfeUInt(GC.brstNbits);
+    DFEType reqSizeType = dfeUInt(GC.sizeBits);
+    DFEVar bvc = BV_CAddr.cast(reqAddrType);
+    DFEVar bvn = BV_NAddr.cast(reqAddrType);
+    DFEVar baseAddr = bvMode ? bvn : bvc;
+      //optimization.pushPipeliningFactor(0);
+      //DFEVar endSignal = BVNdone & (bvCnt.eq(0));
+        //DFEVar endSignal = (BVNdone & (bvCnt.eq(0))) | cnt.eq(200);
+      //optimization.popPipeliningFactor();
+    DFEVar req_brst_addr = ~endSignal 
+                        ? baseAddr + 
+                          brstCnt.cast(reqAddrType) + 
+                          reqMore.cast(reqAddrType) //request 1 ahead (almostDone)
+                        : constant.var(reqAddrType, 1<<27);
+    DFEVar req_size = ~endSignal ? constant.var(reqSizeType, brstInc) :
+                          constant.var(reqSizeType, 1);
+    DFEVar req_en = reqStart | reqMore | endSignal;
+    io.output("memReq", req_size#req_brst_addr#req_en, dfeRawBits(GC.memReqWidth));
+      //io.output("req_brst_addr", req_brst_addr, reqAddrType);
+      //io.output("req_size"     , req_size     , reqSizeType);
+      //io.output("req_en"       , req_en       , dfeBool());
+
+    // Outputs to clear done signals
+    DFEVar clrDone = bvcArrayCtrl & brstCnt.eq(0) & pktCnt.eq(0);
+    io.output("clrDoneEdgeRdr" , clrDone , dfeBool(), clrDone);
+    io.output("clrDoneLvlRdr"  , clrDone , dfeBool(), clrDone);
+    io.output("clrDoneLvlUpd"  , clrDone , dfeBool(), clrDone);
+
+    flush.onTrigger(constant.var(false)); //run without restriction or constraint
+
+
+    // Debug
+    debug.printf("BVCReader: cnt=%d, bvCnt=%d, BVNDone=%d, numElems=%d\n", 
+      cnt, bvCnt, BVNdone, numElems);
+    debug.printf("    arCtrl=%d, endBrst=%d, endPkt=%d, bvcAr = ", 
+      bvcArrayCtrl, endBrst, endPkt);
+      printArray(bvcArrayCtrl, bvcArray.data.elementsAsArray(), arSize); 
+      debug.printf(bvcArrayCtrl, "\n");
+    debug.printf(bvcArrayCtrl, "    pktMask = "); 
+      printArray(bvcArrayCtrl, pktMask, arSize); debug.printf("\n");
+    debug.printf("    pktCnt=%d, brstCnt=%d, goodBrst=%d, goodPkt=%d, lastPkt=%d\n",
+      pktCnt, brstCnt, goodBrst, goodPkt, lastPkt);
+    debug.printf("    arbReq=%o, bvElemRdEn=%o, nodeToSend=%d\n",
+      arbReq, bvElemRdEn2, nodeToSend);
+    debug.printf("    ndNum=%d, ndNumCtrl=%d, curLvl=%d, bvMode=%d, bvcDone=n/a\n",
+      nodeToSend, sendElem, curLvlCnt, bvMode);
+    debug.printf("    req_brst_addr=%d, req_size=%d, req_en=%d, endSignal=%d\n",
+      req_brst_addr, req_size, req_en, endSignal);
+  }
+}
+

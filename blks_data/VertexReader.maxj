@@ -1,0 +1,66 @@
+package bfs_rep_u.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.IO.*;
+import bfs_rep_u.GC;
+
+public class NodeReader extends Kernel {
+
+  public NodeReader(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(64);
+    // Scalar Inputs
+    DFEVar dbgStartCnt = io.scalarInput("StartCnt", dfeUInt(64));
+    DFEVar scalRoot    = io.scalarInput("RootNode", dfeUInt(32));
+
+    DFEType nodeType = dfeUInt(GC.NODEWIDTH);
+      //DFEVar ndNumCtrl = io.input("ndNumCtrl", dfeBool());
+      //DFEVar ndNum_In  = io.input("ndNum", nodeType, ndNumCtrl);
+    NonBlockingInput<DFEVar> ndNum_In =
+      io.nonBlockingInput("ndNum", nodeType, constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar ndNum     = ndNum_In.data;
+    DFEVar ndNumCtrl = ndNum_In.valid;
+
+    // Root node insertion
+    int buf = GC.NODEWIDTH - 32; // assume NODEWIDTH >= 32
+    DFEVar rootRaw  = constant.var(dfeUInt(buf), 0) # scalRoot;
+    DFEVar root     = rootRaw.cast(nodeType);
+    DFEVar node     = cnt.eq(dbgStartCnt) ? root                : ndNum;
+    DFEVar nodeCtrl = cnt.eq(dbgStartCnt) ? 
+                      constant.var(true)  : ndNumCtrl;
+
+    // Outputs to EdgeReader
+    DFEType nodeOutType = dfeUInt(GC.nodeWidth);
+    DFEVar nodeOut = node.slice(0, GC.nodeWidth).cast(nodeOutType);
+    io.output("elem", nodeOut, nodeOutType, nodeCtrl);
+
+    // Outputs to MemUnit: emit read request per valid incoming node
+    DFEVar req_brst_addr = node.slice(GC.nPBBits, GC.brstNbits).cast(dfeUInt(GC.brstNbits));
+    int lastNodeInBrstIdx = GC.NODESPERBRST-1;
+    DFEVar elemIdx = node.slice(0, GC.nPBBits).cast(dfeUInt(GC.nPBBits));
+    DFEVar lastNodeInBrst = elemIdx.eq(lastNodeInBrstIdx);
+    DFEVar req_size = lastNodeInBrst?  constant.var(dfeUInt(GC.sizeBits), 2) : 
+                        constant.var(dfeUInt(GC.sizeBits) , 1);
+    DFEVar req_en = nodeCtrl;
+    io.output("memReq", req_size#req_brst_addr#req_en, dfeRawBits(GC.memReqWidth));
+      //io.output("req_brst_addr", req_brst_addr, dfeUInt(GC.brstNbits));
+      //io.output("req_size"     , req_size, dfeUInt(GC.sizeBits));
+      //io.output("req_en"       , req_en, dfeBool());
+
+    // debug
+    debug.printf("NodeReader: cnt=%d, ndNum_In=%d, elemIdx=%d, ndNumCtrl=%d, node=%d, nodeCtrl=%d\n", 
+      cnt, ndNum, elemIdx, ndNumCtrl, node, nodeCtrl);
+    debug.printf("    req_brst_addr=%d, req_en=%d, req_size=%d\n", 
+      req_brst_addr, req_en, req_size);
+    //debug.printf(cnt.eq(0), "cnt=0, numNodes=%d\n", GC.scal.numNodes);
+
+    // some watch value seems necessary for debug.printf to show up...
+    cnt.watch("cnt"); 
+
+    flush.onTrigger(constant.var(false));
+  }
+}

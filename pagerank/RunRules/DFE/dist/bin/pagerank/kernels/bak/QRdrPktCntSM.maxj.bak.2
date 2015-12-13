@@ -1,0 +1,206 @@
+/*
+ * A Kernel State Machine that handles complex control signals for LvlReader
+ * kernel.  Outputs generated are:
+ *   incRdPtr for edgePtr RAMs
+ * Includes packet counter
+ */
+
+package graph_accel.kernels;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelLib;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmInput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmOutput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateValue;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmValue;
+import com.maxeler.maxcompiler.v2.statemachine.kernel.KernelStateMachine;
+import com.maxeler.maxcompiler.v2.statemachine.types.DFEsmValueType;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.buffer.DFEsmFifo;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.Buffer;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.Buffer.BufferSpec;
+import graph_accel.GC;
+
+public class QRdrPktCntSM extends KernelStateMachine {
+
+  DFEsmFifo numPktsFifo;
+
+  // I/O
+  private final DFEsmInput  iNumPktsVal;
+  private final DFEsmInput  iNumPkts;
+  private final DFEsmInput  iPktVal;
+  private final DFEsmOutput oIncRdPtr;
+  private final DFEsmOutput oPktCnt;
+
+  /*
+  //debug scalar outputs
+  private final DFEsmOutput oScal0;
+    private final DFEsmStateValue oReg0;
+  private final DFEsmOutput oScal1;
+    private final DFEsmStateValue oReg1;
+  private final DFEsmOutput oScal2;
+    private final DFEsmStateValue oReg2;
+  private final DFEsmOutput oScal3;
+    private final DFEsmStateValue oReg3;
+  */
+
+  // State
+  private final DFEsmStateValue dbgCnt;
+  private final DFEsmStateValue dbgCntA;
+  private final DFEsmStateValue dbgDone1;
+  private final DFEsmStateValue dbgDone2;
+  private final DFEsmStateValue dbgDone3;
+  private final DFEsmStateValue pktCounter;
+  private final DFEsmStateValue dataAvail;
+  private final DFEsmStateValue numPktsValD;
+
+  public QRdrPktCntSM(KernelLib owner, int cntWidth, int qDepth) {
+    super(owner);
+
+    DFEsmValueType counterType = dfeUInt(cntWidth);
+    Buffer.DFEsmFifoConfig numPktsFifoCfg = new Buffer.DFEsmFifoConfig();
+    //numPktsFifoCfg.setBufferSpec(BufferSpec.UseLUTRam);
+    numPktsFifoCfg.setIsFirstWordFallThrough();
+    numPktsFifoCfg.setHasDataCount();
+    numPktsFifoCfg.setHasValidFlag();
+    numPktsFifo = buffer.fifo(counterType, qDepth, numPktsFifoCfg);
+
+    // Inputs
+    iNumPktsVal  = io.input("numPktsVal", dfeBool());
+    iNumPkts     = io.input("numPkts", counterType);
+    iPktVal      = io.input("pktVal", dfeBool());
+    // Outputs
+    oIncRdPtr    = io.output("incRdPtr", dfeBool());
+    oPktCnt      = io.output("pktCnt", counterType); 
+    /*
+    // debug scalar outputs
+    oScal0 = io.scalarOutput("scal0", counterType);
+      oReg0 = state.value(counterType, 0);
+    oScal1 = io.scalarOutput("scal1", dfeUInt(32));
+      oReg1 = state.value(dfeUInt(32), 0);
+    oScal2 = io.scalarOutput("scal2", dfeUInt(32));
+      oReg2 = state.value(dfeUInt(32), 0);
+    oScal3 = io.scalarOutput("scal3", dfeUInt(32));
+      oReg3 = state.value(dfeUInt(32), 0);
+    */
+    // State
+    dbgCnt     = state.value(dfeUInt(32), 0);
+    dbgCntA    = state.value(dfeUInt(32), 0);
+    dbgDone1 = state.value(dfeBool(), false);
+    dbgDone2 = state.value(dfeBool(), false);
+    dbgDone3 = state.value(dfeBool(), false);
+    pktCounter = state.value(counterType, 0);
+    numPktsValD = state.value(dfeBool(), false);
+    dataAvail  = state.value(dfeBool(), false); // "empty" could mean one datum
+  }
+
+  @Override
+  protected void nextState() {
+    dbgCnt.next <== dbgCnt+1;
+    dbgCntA.next <== dbgCntA;
+    pktCounter.next <== pktCounter;
+    dataAvail.next  <== dataAvail;
+    dbgDone1.next <== dbgDone1;
+    dbgDone2.next <== dbgDone2;
+    dbgDone3.next <== dbgDone3;
+
+    DFEsmValue curFifoOutput = numPktsFifo.output.dataOut;
+    DFEsmValue lastPkt = pktCounter.eq(curFifoOutput-1);
+    numPktsValD.next <== iNumPktsVal;
+
+    IF (numPktsFifo.input.full) {
+      debug.printf("  --Full-fifo..\n");
+    }
+
+    // Fifo inputs
+    numPktsFifo.input.dataIn <== iNumPkts;
+    numPktsFifo.input.writeEnable <== iNumPktsVal;
+    //DFEsmValue rdEn = (~dataAvail & iNumPktsVal) |   //first data fall-through
+    //                  (iPktVal & (pktCounter.eq(curFifoOutput-1))); //last pkt
+    numPktsFifo.output.readEnable <== iPktVal & lastPkt;
+
+    /*
+    // Debug
+    //iPktVal=1, wrap=0, incRdPtr=0 [wrap = lastPktD & pktCounter.eq(0)]
+    //sawNumPktsVal=1, numPkts value is correct
+    //--curFifoOutput remains 0 even after write--
+    IF (iNumPktsVal) {
+      //oReg0.next <== numPktsFifo.data_count;  //0-data_count after numPktsVal
+      //oReg1.next <== numPktsFifo.output.valid;  //1-outputVal after numPktsVal
+      dbgCntA.next <== dbgCnt;   //capture cycle of numPktsVal
+    }
+    oReg1.next <== oReg1;
+    IF (iPktVal) {
+      IF (~dbgDone1) {
+        oReg1.next <== dbgCnt - dbgCntA; //1-number of cycles between numPktsVal and iPktVal (rdEn)
+        dbgDone1.next <== constant.value(true);
+      }
+    }
+    oReg2.next <== oReg2;
+    IF (~(numPktsFifo.output.empty)) {
+      IF (~dbgDone2) {
+        oReg2.next <== dbgCnt - dbgCntA;  //2-number of cycles between numPktsVal and ~empty
+        dbgDone2.next <== constant.value(true);
+      }
+    }
+    oReg0.next <== oReg0;
+    oReg3.next <== oReg3;
+    IF (numPktsFifo.output.valid) {
+      IF (~dbgDone3) {
+        oReg0.next <== curFifoOutput;
+        oReg3.next <== dbgCnt - dbgCntA;    //3-number of cycles between numPktsVal and outputVal
+        dbgDone3.next <== constant.value(true);
+      }
+    }
+    */
+
+    // Packet Counter
+    IF (iPktVal) { // the numPktsFifo should never be empty here
+      IF (pktCounter.eq(curFifoOutput-1)) { // all pkts have been received
+        pktCounter.next <== 0;
+      } ELSE {
+        pktCounter.next <== pktCounter+1;
+      }
+    }
+
+    /*
+    IF (~ numPktsFifo.output.empty) { // "empty" could mean one datum 
+      dataAvail.next <== 1;
+    } ELSE IF (dataAvail) { // empty & dataAvail = exactly one element in Fifo
+      IF (iNumPktsVal) {
+        dataAvail.next <== 1;
+      } ELSE IF (iPktVal & pktCounter.eq(curFifoOutput-1)) {
+        dataAvail.next <== 0;
+      }
+    }
+    ELSE { // empty & ~dataAvail = Fifo is completely empty
+      IF (iNumPktsVal) {
+        dataAvail.next <== 1;
+      } ELSE IF (iPktVal & pktCounter.eq(curFifoOutput-1)) {
+        dataAvail.next <== 0; // empty Fifo is read and written simult
+      }
+    }
+    */
+
+  }
+
+  @Override
+  protected void outputFunction() {
+    /*
+    // debug scalars
+    oScal0 <== oReg0;
+    oScal1 <== oReg1;
+    oScal2 <== oReg2;
+    oScal3 <== oReg3;
+    */
+
+    DFEsmValue curFifoOutput = numPktsFifo.output.dataOut;
+    DFEsmValue lastPkt = pktCounter.eq(curFifoOutput-1);
+
+    oIncRdPtr <== iPktVal & lastPkt;
+    oPktCnt <== pktCounter;
+
+
+    debug.printf("[QRdrPktCntSM] cnt=%d : nPkts=%d, nPktsVal=%d, pktVal=%d, oInc=%d, oPktCnt=%d\n",
+                 dbgCnt, iNumPkts, iNumPktsVal, iPktVal, oIncRdPtr, oPktCnt);
+    debug.printf("    dataAvail=%d, fifo.output=%d, fifo.empty=%d\n",
+                 dataAvail, numPktsFifo.output.dataOut, numPktsFifo.output.empty);
+  }
+}

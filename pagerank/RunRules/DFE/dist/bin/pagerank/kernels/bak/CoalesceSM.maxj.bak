@@ -1,0 +1,578 @@
+
+package graph_accel.kernels;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelLib;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmInput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmOutput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateValue;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmValue;
+import com.maxeler.maxcompiler.v2.statemachine.kernel.KernelStateMachine;
+import com.maxeler.maxcompiler.v2.statemachine.types.DFEsmValueType;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.Bitops;
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.buffer.DFEsmFifo;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.Buffer;
+import graph_accel.GC;
+
+public class CoalesceSM extends KernelStateMachine {
+
+  // I/O
+  private final DFEsmInput  iNbrIn;
+  private final DFEsmInput  iNbrInVal;
+  private final DFEsmInput  iCurLvl;
+  private final DFEsmInput  iDataArray;
+  private final DFEsmInput  iDataArrayVal;
+  private final DFEsmOutput oUpdNbrsBase;
+  private final DFEsmOutput oUpdNbrsCtrl;
+  private final DFEsmOutput oUpdNbrsBitVec;
+  private final DFEsmOutput oPropArray;
+  private final DFEsmOutput oPropArrayVal;
+  private final DFEsmOutput oMemReqEn;
+  private final DFEsmOutput oMemReqAddr;
+  private final DFEsmOutput oMemReqEnRd;
+  private final DFEsmOutput oMemReqAddrRd;
+  private final DFEsmOutput oEmptyQ;
+
+  // State
+  // misc
+  DFEsmStateValue dbgCnt;
+  DFEsmStateValue pktCnt;
+  // outstanding request queue
+  private final int orqDepth = 16; //128; //256
+  private final int orqPtrWidth = MathUtils.bitsToAddress(orqDepth);
+  DFEsmStateValue[] orqVal;
+  DFEsmStateValue[] orqAddr;
+  DFEsmStateValue[] orqBitVec;
+  DFEsmStateValue   orqRdPtr;
+  DFEsmStateValue   orqWrPtr;
+  DFEsmStateValue   spaceInORQ;
+  DFEsmStateValue   nbrInD, nbrInValD, nbrInORQ, nbrORQentry;
+  DFEsmStateValue   orqBitVecNbr;
+  DFEsmStateValue   curBitVec;
+  DFEsmStateValue   curAddr;
+  DFEsmStateValue[] bitVecUpdAr;
+  DFEsmStateValue   bitVecUpd;
+  DFEsmStateValue   addrUpd;
+  DFEsmStateValue   cflctBitVec, cflctVal; //, cflctVal2;
+  DFEsmStateValue   orqHCBitVec; //orq head conflict indices
+  DFEsmStateValue   updHCIdx; //upd head conflict index
+  //DFEsmStateValue   orqHCAddr, orqHCVal; //orq head conflict
+  //DFEsmStateValue   updHCAddr, updHCVal; //upd head conflict
+
+  DFEsmStateValue[] dataInBuf;
+  DFEsmStateValue[] dataOutBuf;
+  DFEsmStateValue   dataOutBufCtr;
+  DFEsmStateValue   dataOutBufVal;
+  DFEsmStateValue   doUpdate, doUpdate2;
+  DFEsmStateValue   noWrBufReqEn, noWrBufReqAddr;
+  DFEsmStateValue[][] oArray;
+
+  DFEsmValueType pktType    = dfeUInt(GC.PKTWIDTH);
+  DFEsmValueType nbrType    = dfeUInt(GC.coalesceNbrWidth);
+  DFEsmValueType propType   = dfeUInt(GC.PROPWIDTH);
+  DFEsmValueType bitVecType = dfeUInt(GC.PROPPERBRST);
+  int brstAddrWidth = GC.coalesceNbrWidth - GC.pPBBits;
+  DFEsmValueType brstAddrType = dfeUInt(brstAddrWidth);
+  int arSize = GC.PROPPERPKT;
+
+  DFEsmFifo nbrInFifo;
+  int nbrInFifoDepth = GC.nbrNumRamDepth;
+
+  public CoalesceSM(KernelLib owner) {
+    super(owner);
+
+    // Inputs
+    iNbrIn          = io.input("nbrIn", nbrType);
+    iNbrInVal       = io.input("nbrInVal", dfeBool());
+    iCurLvl         = io.input("curLvl", dfeUInt(GC.PROPWIDTH));
+    iDataArray      = io.input("dataArrayIn", pktType);
+    iDataArrayVal   = io.input("dataArrayInVal", dfeBool());
+    // Outputs
+    oUpdNbrsCtrl    = io.output("updNbrsCtrl", dfeBool());
+    oUpdNbrsBase    = io.output("updNbrsBase", brstAddrType);
+    oUpdNbrsBitVec  = io.output("updNbrsBitVec", bitVecType);
+    oPropArray      = io.output("dataArrayOut", pktType);
+    oPropArrayVal   = io.output("dataArrayOutVal", dfeBool());
+    oMemReqEn       = io.output("reqEn", dfeBool());
+    oMemReqAddr     = io.output("reqBrstAddr", dfeUInt(GC.brstNbits));
+    oMemReqEnRd     = io.output("reqEnRd", dfeBool());
+    oMemReqAddrRd   = io.output("reqBrstAddrRd", dfeUInt(GC.brstNbits));
+    oEmptyQ         = io.output("emptyQ", dfeBool());
+
+    // debug scalar outputs
+    //oORQrdPtr       = io.scalarOutput("orqRdPtr", dfeUInt(orqPtrWidth));
+    //oORQwrPtr       = io.scalarOutput("orqWrPtr", dfeUInt(orqPtrWidth));
+
+    // State
+    dbgCnt      = state.value(dfeUInt(32), 0);
+    pktCnt      = state.value(dfeUInt(GC.pktsPBBits), 0);
+    orqVal      = new DFEsmStateValue[orqDepth];
+    orqAddr     = new DFEsmStateValue[orqDepth];
+    orqBitVec   = new DFEsmStateValue[orqDepth];
+    for (int i = 0; i < orqDepth; i++) {
+      orqVal[i] = state.value(dfeBool(), false);
+      orqAddr[i] = state.value(brstAddrType, 0);
+      orqBitVec[i] = state.value(dfeUInt(GC.PROPPERBRST), 0);
+    }
+    orqRdPtr    = state.value(dfeUInt(orqPtrWidth), 0);
+    orqWrPtr    = state.value(dfeUInt(orqPtrWidth), 0);
+    spaceInORQ  = state.value(dfeBool(), true);
+    nbrInD       = state.value(nbrType, 0);
+    nbrInValD    = state.value(dfeBool(), false);
+    nbrInORQ     = state.value(dfeBool(), false);
+    nbrORQentry  = state.value(dfeUInt(orqPtrWidth), 0);
+    orqBitVecNbr = state.value(dfeUInt(GC.PROPPERBRST), 0);
+
+    curAddr      = state.value(brstAddrType, 0);
+    curBitVec    = state.value(dfeUInt(GC.PROPPERBRST), 0);
+    bitVecUpdAr  = new DFEsmStateValue[GC.PROPPERBRST];
+    for (int i = 0; i < GC.PROPPERBRST; i++) {
+      bitVecUpdAr[i] = state.value(dfeUInt(1), 0);
+    }
+    bitVecUpd    = state.value(dfeUInt(GC.PROPPERBRST), 0);
+    addrUpd      = state.value(brstAddrType, 0);
+    cflctBitVec  = state.value(dfeUInt(GC.PROPPERBRST), 0);
+    cflctVal     = state.value(dfeBool(), false);
+    //cflctVal2    = state.value(dfeBool(), false);
+    orqHCBitVec  = state.value(dfeUInt(GC.PROPPERBRST), 0);
+    updHCIdx     = state.value(dfeUInt(GC.pPBBits), 0);
+    //orqHCAddr    = state.value(brstAddrType, 0);
+    //orqHCVal     = state.value(dfeBool(), false);
+    //updHCAddr    = state.value(brstAddrType, 0);
+    //updHCVal     = state.value(dfeBool(), false);
+
+    dataInBuf   = new DFEsmStateValue[GC.PKTSPERBRST];
+    dataOutBuf   = new DFEsmStateValue[GC.PKTSPERBRST];
+    for (int i = 0; i < GC.PKTSPERBRST; i++) {
+      dataInBuf[i] = state.value(pktType, 0);
+      dataOutBuf[i] = state.value(pktType, 0);
+    }
+    dataOutBufCtr = state.value(dfeUInt(GC.pktsPBBits), 0);
+    dataOutBufVal = state.value(dfeBool(), 0);
+    doUpdate = state.value(dfeBool(), false);
+    doUpdate2    = state.value(dfeBool(), false);
+    noWrBufReqEn   = state.value(dfeBool(), false);
+    noWrBufReqAddr = state.value(brstAddrType, 0);
+    oArray = new DFEsmStateValue[GC.PKTSPERBRST][arSize];
+    for (int i = 0; i < GC.PKTSPERBRST; i++) {
+      for (int j = 0; j < arSize; j++) 
+        oArray[i][j] = state.value(dfeUInt(GC.PROPWIDTH), 0);
+    }
+
+    Buffer.DFEsmFifoConfig nbrInCfg = new Buffer.DFEsmFifoConfig();
+    nbrInCfg.setIsFirstWordFallThrough();
+    nbrInCfg.setHasDataCount();
+    nbrInCfg.setHasValidFlag();
+    nbrInFifo = buffer.fifo(nbrType, nbrInFifoDepth, nbrInCfg);
+  }
+
+  @Override
+  protected void nextState() {
+    dbgCnt.next <== dbgCnt+1;
+    IF (iDataArrayVal)
+      pktCnt.next <== pktCnt+1;
+    ELSE
+      pktCnt.next <== pktCnt;
+    for (int i = 0; i < orqDepth; i++) {
+      orqAddr[i].next <== orqAddr[i];
+      orqVal[i].next <== orqVal[i];
+      orqBitVec[i].next <== orqBitVec[i];
+    }
+    orqRdPtr.next <== orqRdPtr;
+    orqWrPtr.next <== orqWrPtr;
+    spaceInORQ.next <== spaceInORQ;
+    nbrInORQ.next          <== constant.value(false); //pulsed
+    nbrORQentry.next       <== nbrORQentry;
+    // latch iNbrIn
+    nbrInD.next       <== nbrInD;
+    //nbrInValD.next    <== nbrInFifo.output.valid & spaceInORQ;
+    IF (nbrInFifo.output.valid) { nbrInD.next <== nbrInFifo.output.dataOut; }
+    orqBitVecNbr.next <== constant.value(dfeUInt(GC.PROPPERBRST), 0); //pulsed
+    curBitVec.next    <== curBitVec;
+    curAddr.next      <== curAddr;
+    for (int i = 0; i < GC.PROPPERBRST; i++) {
+      bitVecUpdAr[i].next <== bitVecUpdAr[i];
+    }
+    bitVecUpd.next    <== bitVecUpd;
+    addrUpd.next      <== addrUpd;
+    cflctBitVec.next  <== cflctBitVec;
+    cflctVal.next     <== constant.value(false); //pulsed
+    //cflctVal2.next    <== constant.value(false); //pulsed
+    orqHCBitVec.next  <== orqHCBitVec;
+    updHCIdx.next     <== updHCIdx;
+    //orqHCAddr.next <== orqHCAddr; orqHCVal.next <== orqHCVal;
+    //updHCAddr.next <== updHCAddr; updHCVal.next <== updHCVal;
+    for (int i = 0; i < GC.PKTSPERBRST; i++) {
+      dataInBuf[i].next <== dataInBuf[i];
+      dataOutBuf[i].next <== dataOutBuf[i];
+    }
+    dataOutBufCtr.next <== dataOutBufCtr;
+    dataOutBufVal.next <== constant.value(false); //pulsed
+    doUpdate.next <== doUpdate;
+    doUpdate2.next    <== constant.value(false); //pulsed
+    for (int i = 0; i < GC.PKTSPERBRST; i++) {
+      for (int j = 0; j < arSize; j++)
+        oArray[i][j].next <== oArray[i][j];
+    }
+    noWrBufReqEn.next   <== constant.value(false); //pulsed
+    noWrBufReqAddr.next <== noWrBufReqAddr;
+
+    // nbrInFifo
+    nbrInFifo.input.dataIn      <== iNbrIn;
+    nbrInFifo.input.writeEnable <== iNbrInVal;
+    DFEsmValue nbrIn    = nbrInFifo.output.dataOut;
+
+    // Conflict with Update-2 phase (avoid data race with burst being updated)
+    DFEsmValue nbrInAddr = nbrIn[GC.coalesceNbrWidth-1:GC.pPBBits];
+    DFEsmValue nbrInIdx  = nbrIn[GC.pPBBits-1:0];
+    DFEsmValue nbrCflct2 = doUpdate2 & nbrInAddr.eq(addrUpd) & nbrInFifo.output.valid;
+
+    // nbrInFifo (cont.)
+    //^^DFEsmValue nbrInVal = nbrInFifo.output.valid & spaceInORQ;
+    DFEsmValue nbrInVal = nbrInFifo.output.valid & spaceInORQ & ~nbrCflct2;
+    nbrInValD.next    <== nbrInVal;
+    DFEsmValue orqNotFull = orqRdPtr.neq(orqWrPtr);
+
+    int spaceThresh = 3;
+    int orqAvail = orqDepth-1;
+    IF (orqWrPtr > orqRdPtr) {
+      DFEsmValue used = orqWrPtr - orqRdPtr;
+      spaceInORQ.next <== (orqAvail - used) > spaceThresh;
+    }
+    IF (orqRdPtr > orqWrPtr) {
+      DFEsmValue used = (orqAvail - orqRdPtr) + orqWrPtr;
+      spaceInORQ.next <== (orqAvail - used) > spaceThresh;
+    }
+    //^^nbrInFifo.output.readEnable <== ~nbrInFifo.output.empty & spaceInORQ;
+    nbrInFifo.output.readEnable <== ~nbrInFifo.output.empty & spaceInORQ & ~nbrCflct2;
+
+    // Incoming read request: check if incoming nbr already exists in ORQ
+    IF (nbrInVal) {
+      DFEsmValue idxDec = bitops.oneHotEncode(nbrInIdx);
+      orqBitVecNbr.next <== idxDec;
+      for (int i = 0; i < orqDepth; i++) {
+        // do not modify the head of ORQ -- may lead to races
+        IF (orqVal[i] & orqAddr[i].eq(nbrInAddr)) {
+          nbrInORQ.next <== constant.value(true);
+          nbrORQentry.next <== constant.value(dfeUInt(orqPtrWidth), i);
+        }
+
+        // handle case of two consecutive neighbors from same burst
+        DFEsmValue nbrInDAddr = nbrInD[GC.coalesceNbrWidth-1:GC.pPBBits]; 
+        IF (nbrInValD & ~nbrInORQ & nbrInAddr.eq(nbrInDAddr)) {
+          nbrInORQ.next <== constant.value(true);
+          nbrORQentry.next <== orqWrPtr;
+        }
+
+        //--if head of ORQ (head-conflict), accumulate the conflicting indices
+        IF (orqVal[i] & orqAddr[i].eq(nbrInAddr) & orqRdPtr.eq(i)) {
+          orqHCBitVec.next <== orqHCBitVec | idxDec;
+          //orqHCAddr.next <== orqAddr[i];
+          //orqHCVal.next  <== constant.value(true);
+        }
+      }
+    }
+    // Store in ORQ data structure
+    IF (nbrInValD) {
+      // update the bitVec if address exists in ORQ
+      IF (nbrInORQ) {
+        for (int i = 0; i < orqDepth; i++) {
+          IF (nbrORQentry.eq(i)) {
+            orqBitVec[i].next <== orqBitVec[i] | orqBitVecNbr;
+          }
+        }
+      }
+      // append to ORQ if no existing entry for incoming nbr
+      //ELSE {
+      ELSE IF (~cflctVal) {
+        orqWrPtr.next <== orqWrPtr+1;  // increment the queue write pointer
+        for (int i = 0; i < orqDepth; i++) {
+          IF (orqWrPtr.eq(i)) {
+            orqAddr  [i].next <== nbrInD[GC.coalesceNbrWidth-1:GC.pPBBits]; 
+            orqVal   [i].next <== constant.value(true);
+            orqBitVec[i].next <== orqBitVecNbr; // | orqBitVec[i] 
+          }
+        }
+      }
+    }
+
+    // Register brst address and bit-vector at head of ORQ
+    for (int i = 0; i < orqDepth; i++) {
+      IF (orqRdPtr.eq(i) & orqVal[i]) {
+        curAddr.next   <== orqAddr[i];
+        curBitVec.next <== orqBitVec[i];
+      }
+    }
+    
+    // Incoming data packet
+    IF (iDataArrayVal) {
+      //DFEsmValue nbrInAddr = nbrIn[GC.coalesceNbrWidth-1:GC.pPBBits];
+      //DFEsmValue nbrInIdx = nbrIn[GC.pPBBits-1:0];
+      DFEsmValue nbrInIdxDec = bitops.oneHotEncode(nbrInIdx);
+
+      //-- if there is incoming conflicting nbr, add nbr to current bit-vec
+      DFEsmValue nbrInHC = nbrInVal & curAddr.eq(nbrInAddr);
+
+      DFEsmValue zeros = constant.value(dfeUInt(GC.PROPPERBRST), 0);
+      DFEsmValue nbrInHCFullRaw = constant.value(dfeUInt(GC.PROPPERBRST-1), 0) #
+                                  nbrInHC.cast(dfeUInt(1));
+      DFEsmValue nbrInHCFull = nbrInHCFullRaw.cast(dfeUInt(GC.PROPPERBRST));
+
+      DFEsmValue nbrInSwitch = zeros - nbrInHCFull; //all ones or zeros, depending on nbrInHC
+      DFEsmValue nbrInDec = nbrInIdxDec & nbrInSwitch;
+      DFEsmValue bitVec   = curBitVec | orqHCBitVec | nbrInDec;
+      //
+      //DFEsmValue bitVecFinal = curBitVec | orqHCBitVec;
+      //DFEsmValue bitVecMerge = curBitVec | orqHCBitVec | nbrInIdxDec;
+
+      //debug.printf("    nbrInHC=%d, nbrInSwitch=%o, bitVec=%o\n", 
+      //             nbrInHC, nbrInSwitch, bitVec);
+
+      // capture incoming burst into holding buffer
+      for (int i = 0; i < GC.PKTSPERBRST; i++) {
+        IF (pktCnt.eq(i)) {
+          dataInBuf[i].next <== iDataArray;
+        }
+      }
+
+      // upon burst completion
+      IF (pktCnt.eq(GC.PKTSPERBRST-1)) {
+        int midPoint = GC.PROPPERBRST/2;
+
+        // check to see if update is needed
+        for (int i = 0; i < arSize; i++) {
+          // supports only 2 pkts per brst (pktCnt = 0 or 1)
+          DFEsmValue elemData0 = dataInBuf[0][(i+1)*GC.PROPWIDTH-1 : i*GC.PROPWIDTH];
+          DFEsmValue elemData1 = iDataArray[(i+1)*GC.PROPWIDTH-1 : i*GC.PROPWIDTH];
+
+          IF (bitVec[i] & elemData0>100) { //use -1?
+            doUpdate.next <== constant.value(true);
+            bitVecUpdAr[i].next <== constant.value(dfeUInt(1), 1);
+            //bitVecUpd.next <== bitVec; //<--No. Need to update individually.
+          }
+          IF (bitVec[midPoint + i] & elemData1>100) { //use -1?
+            doUpdate.next <== constant.value(true);
+            bitVecUpdAr[midPoint + i].next <== constant.value(dfeUInt(1), 1);
+            //bitVecUpd.next <== bitVec; //<--No. Need to update individually.
+          }
+        }
+        orqRdPtr.next  <== orqRdPtr+1;  //increment ORQ read pointer
+        addrUpd.next   <== curAddr;
+        //--pass ORQ head-conflict information to update phase
+        //orqHCVal.next  <== constant.value(false);
+        //IF (~iNbrInVal) {
+        //  updHCAddr.next <== orqHCAddr;
+        //  updHCVal.next  <== orqHCVal;
+        //}
+        // clear accumulating head-conflict bit-vector
+        orqHCBitVec.next <== constant.value(dfeUInt(GC.PROPPERBRST), 0);
+        // invalidate the ORQ entry
+        for (int i = 0; i < orqDepth; i++) {
+          IF (orqRdPtr.eq(i)) { 
+            orqVal[i].next <== constant.value(false);
+            curAddr.next   <== orqAddr[(i+1)%orqDepth];
+            curBitVec.next <== orqBitVec[(i+1)%orqDepth];
+            //bitVecUpd.next <== curBitVec;  //register the bit-vector to use in updating
+            //bitVecUpd.next <== orqBitVec[i]; //might get updated, making curBitVec stale
+          }
+          //--set ORQ head-conflict info in update phase
+          //IF (iNbrInVal & orqVal[i] & orqAddr[i].eq(nbrInAddr) & orqRdPtr.eq(i)) {
+          //  updHCVal.next  <== constant.value(true);
+          //  updHCAddr.next <== orqAddr[i];
+          //}
+        }
+      }
+    }
+
+    // Update-1
+    // When burst has been completely received:  
+    //   Perform update in writebuffer or issue write to memory
+    IF (doUpdate & pktCnt.eq(0)) {
+      // find a different place to clear these signals?
+      // potentially cause processing of incoming nbr to overlap with outgoing?
+      doUpdate.next <== constant.value(false);
+      doUpdate2.next <== constant.value(true);
+
+      // Conflict of this burst with incoming neighbor
+      // NbrInVal check.  if need to update, generate: a boolean and the index to update
+      // Addr being updated is addrUpd
+      // Check the nbrInFifo output (not the global nbrInVal signal)
+      //DFEsmValue nbrInAddr = nbrIn[GC.coalesceNbrWidth-1:GC.pPBBits];
+      DFEsmValue nbrCflct  = nbrInAddr.eq(addrUpd) & nbrInVal;
+      DFEsmValue cflctPkt  = nbrIn[GC.pPBBits-1:GC.pPPBits];
+      DFEsmValue cflctIdx  = nbrIn[GC.pPPBits-1:0];
+      //DFEsmValue nbrInIdx  = nbrIn[GC.pPBBits-1:0];
+      DFEsmValue idxDec    = bitops.oneHotEncode(nbrInIdx);
+      cflctVal.next      <== nbrCflct;
+      cflctBitVec.next   <== idxDec;
+
+      for (int i = 0; i < GC.PKTSPERBRST; i++) {
+        for (int j = 0; j < arSize; j++) {
+          DFEsmValue upd = (bitVecUpdAr[i*arSize + j]) | 
+                           (nbrCflct & cflctPkt.eq(i) & cflctIdx.eq(j));
+          IF (upd) 
+            oArray[i][j].next <== iCurLvl+1;
+          ELSE {
+            DFEsmValue inData = 
+              dataInBuf[i][(j+1)*GC.PROPWIDTH-1 : j*GC.PROPWIDTH];
+            oArray[i][j].next <== inData.cast(propType);
+          }
+        }
+      }
+
+      bitVecUpd.next <==
+        bitVecUpdAr[63] # bitVecUpdAr[62] # bitVecUpdAr[61] # bitVecUpdAr[60] #
+        bitVecUpdAr[59] # bitVecUpdAr[58] # bitVecUpdAr[57] # bitVecUpdAr[56] #
+        bitVecUpdAr[55] # bitVecUpdAr[54] # bitVecUpdAr[53] # bitVecUpdAr[52] #
+        bitVecUpdAr[51] # bitVecUpdAr[50] # bitVecUpdAr[49] # bitVecUpdAr[48] #
+        bitVecUpdAr[47] # bitVecUpdAr[46] # bitVecUpdAr[45] # bitVecUpdAr[44] #
+        bitVecUpdAr[43] # bitVecUpdAr[42] # bitVecUpdAr[41] # bitVecUpdAr[40] #
+        bitVecUpdAr[39] # bitVecUpdAr[38] # bitVecUpdAr[37] # bitVecUpdAr[36] #
+        bitVecUpdAr[35] # bitVecUpdAr[34] # bitVecUpdAr[33] # bitVecUpdAr[32] #
+        bitVecUpdAr[31] # bitVecUpdAr[30] # bitVecUpdAr[29] # bitVecUpdAr[28] #
+        bitVecUpdAr[27] # bitVecUpdAr[26] # bitVecUpdAr[25] # bitVecUpdAr[24] #
+        bitVecUpdAr[23] # bitVecUpdAr[22] # bitVecUpdAr[21] # bitVecUpdAr[20] #
+        bitVecUpdAr[19] # bitVecUpdAr[18] # bitVecUpdAr[17] # bitVecUpdAr[16] #
+        bitVecUpdAr[15] # bitVecUpdAr[14] # bitVecUpdAr[13] # bitVecUpdAr[12] #
+        bitVecUpdAr[11] # bitVecUpdAr[10] # bitVecUpdAr[ 9] # bitVecUpdAr[ 8] #
+        bitVecUpdAr[ 7] # bitVecUpdAr[ 6] # bitVecUpdAr[ 5] # bitVecUpdAr[ 4] #
+        bitVecUpdAr[ 3] # bitVecUpdAr[ 2] # bitVecUpdAr[ 1] # bitVecUpdAr[ 0];
+      for (int i = 0; i < GC.PROPPERBRST; i++) {
+        bitVecUpdAr[i].next <== constant.value(dfeUInt(1), 0);
+      }
+    }
+
+
+    // Update-2
+    // construct outgoing data arrays
+    for (int j = 0; j < GC.PKTSPERBRST; j++) {
+
+//        dataOut = oArray[j][31] & ( 1-idx[j+31] )
+
+      // construct new data arrays
+      DFEsmValue dataOut =
+        oArray[j][31] # oArray[j][30] # oArray[j][29] # oArray[j][28] # 
+        oArray[j][27] # oArray[j][26] # oArray[j][25] # oArray[j][24] # 
+        oArray[j][23] # oArray[j][22] # oArray[j][21] # oArray[j][20] # 
+        oArray[j][19] # oArray[j][18] # oArray[j][17] # oArray[j][16] # 
+        oArray[j][15] # oArray[j][14] # oArray[j][13] # oArray[j][12] # 
+        oArray[j][11] # oArray[j][10] # oArray[j][ 9] # oArray[j][ 8] # 
+        oArray[j][ 7] # oArray[j][ 6] # oArray[j][ 5] # oArray[j][ 4] # 
+        oArray[j][ 3] # oArray[j][ 2] # oArray[j][ 1] # oArray[j][ 0] ;
+
+      IF (doUpdate2) {
+        dataOutBuf[j].next <== dataOut;
+      }
+    }
+    // writeback originating from incoming data
+    IF (doUpdate2) {
+      dataOutBufCtr.next <== dataOutBufCtr+1;
+      dataOutBufVal.next <== constant.value(true);
+      noWrBufReqEn.next   <== constant.value(true);
+      noWrBufReqAddr.next <== addrUpd;
+
+      // in case of incoming conflict in Update-1
+      IF (cflctVal)
+        bitVecUpd.next <== bitVecUpd | cflctBitVec;
+
+      /*
+      // check for nbrIn conflict in this phase (Update-2)
+      DFEsmValue nbrInAddr = nbrIn[GC.coalesceNbrWidth-1:GC.pPBBits];
+      DFEsmValue nbrCflct  = nbrInAddr.eq(addrUpd) & nbrInVal;
+      DFEsmValue cflctPkt  = nbrIn[GC.pPBBits-1:GC.pPPBits];
+      DFEsmValue cflctIdx  = nbrIn[GC.pPPBits-1:0];
+      DFEsmValue nbrInIdx  = nbrIn[GC.pPBBits-1:0];
+      //DFEsmValue idxDec    = bitops.oneHotEncode(nbrInIdx);
+      cflctVal2.next     <== nbrCflct;
+      */
+    }
+    // Completing writeback
+    IF (dataOutBufCtr > 0) {
+      dataOutBufVal.next <== constant.value(true);
+      dataOutBufCtr.next <== dataOutBufCtr+1;
+    }
+  }
+
+  @Override
+  protected void outputFunction() {
+    int bufBits  = GC.brstNbits - brstAddrWidth;
+
+    oEmptyQ         <== orqRdPtr.eq(orqWrPtr) & nbrInFifo.output.empty & 
+                        ~iNbrInVal & ~nbrInValD;
+    oUpdNbrsCtrl    <== noWrBufReqEn;
+
+    // Memory Request Outputs: Write
+    oMemReqEn      <== noWrBufReqEn;
+    oMemReqAddr    <== constant.value(dfeUInt(bufBits), 0) # noWrBufReqAddr;
+    oUpdNbrsBitVec <== bitVecUpd;
+    oUpdNbrsBase   <== noWrBufReqAddr;
+
+
+    // Memory Request Outputs: Read request if the nbr is not already in ORQ and
+    //   the nbr is not included in the currently-processed bitvec (update-1)
+    oMemReqEnRd  <== nbrInValD & ~nbrInORQ & ~cflctVal;
+    // -- count reads
+    // -- initialize RAM to zero, then build hw bitfile
+    // -- for update-1 conflicts, need to check propArray to see if need update?
+    //    -- should not need to: bit-vector in LvlReader should not pass through
+    //       an already-updated node
+    // -- add solution for incoming update-2 conflicts
+    //    -- delay the update-2 conflict (don't read from the fifo)
+    oMemReqAddrRd <== constant.value(dfeUInt(bufBits), 0) # 
+                      nbrInD[GC.coalesceNbrWidth-1:GC.pPBBits];
+
+    // Data Array Outputs
+    oPropArrayVal <== dataOutBufVal;
+    IF (dataOutBufCtr.eq(0)) 
+      oPropArray <== dataOutBuf[1];
+    ELSE 
+      oPropArray <== dataOutBuf[0];
+
+    // temp variables 
+    DFEsmValue nbrIn    = nbrInFifo.output.dataOut;
+    DFEsmValue nbrInAddr = nbrIn[GC.coalesceNbrWidth-1:GC.pPBBits];
+    DFEsmValue nbrCflct2 = doUpdate2 & nbrInAddr.eq(addrUpd) & nbrInFifo.output.valid;
+    DFEsmValue nbrInVal = nbrInFifo.output.valid & spaceInORQ & ~nbrCflct2;
+    DFEsmValue readEn = ~nbrInFifo.output.empty & spaceInORQ & ~nbrCflct2;
+
+    debug.printf("[CoalesceSM] cnt=%d : nbrIn=%d, nbrInVal=%d, ArrayVal=%d, pktCnt=%d\n",
+      dbgCnt, iNbrIn, iNbrInVal, iDataArrayVal, pktCnt);
+    debug.printf("    orq.rdPtr=%d, orq.wrPtr=%d\n", orqRdPtr, orqWrPtr);
+    debug.printf("    nbrInFifo: nbr=%d, val=%d, readEn=%d, empty=%d, cnt=%d, nbrCflct2=%d\n",
+      nbrInFifo.output.dataOut, nbrInVal, readEn, nbrInFifo.output.empty,
+      nbrInFifo.data_count, nbrCflct2);
+    debug.printf("    nbrInD=%d, nbrInORQ=%d, nbrORQentry=%d, nbrInValD=%d, orqBitVecNbr=%o\n",
+      nbrInD, nbrInORQ, nbrORQentry, nbrInValD, orqBitVecNbr);
+      debug.printf("    bitVecUpdAr=");
+      for (int i = GC.PROPPERBRST-1; i >= 0; i--) {
+        debug.printf("%d", bitVecUpdAr[i]);
+      }
+      debug.printf("\n");
+    debug.printf("    curAddr=%d, curBitVec=%o, addrUpd=%d, bitVecUpd=%o, cflctVal=%d\n",
+      curAddr, curBitVec, addrUpd, bitVecUpd, cflctVal);
+    debug.printf("    memReqEnRd=%d, memReqAddrRd=%d, orqHCBitVec=%x, updHCIdx=%d\n",
+      oMemReqEnRd, oMemReqAddrRd, orqHCBitVec, updHCIdx);
+    debug.printf("    doUpdate=%d, doUpdate2=%d\n", doUpdate, doUpdate2);
+    debug.printf("    dOutVal=%d, dOutCtr=%d, noWrBufReqEn=%d, noWrReqAddr=%d\n",
+      dataOutBufVal, dataOutBufCtr, noWrBufReqEn, noWrBufReqAddr);
+    //////
+    //temp
+    IF (dataOutBufVal) {
+      debug.printf("    dataOutBuf:\n ");
+      for (int i = 0; i < 2; i++) 
+        debug.printf("    %x\n", dataOutBuf[i]);
+    }
+    debug.printf("    ORQ entries 0-15:\n"); 
+    for (int i = 0; i < orqDepth; i+=2) {
+      debug.printf("      ORQ_%d[val=%d addr=%d bitVec=%o]  ORQ_%d[val=%d addr=%d bitVec=%o]\n",
+        i, orqVal[i], orqAddr[i], orqBitVec[i], i+1, orqVal[i+1], orqAddr[i+1], orqBitVec[i+1]);
+    }
+    debug.printf("    oArray :\n");
+    for (int i = 0; i < 2; i++) {
+      debug.printf("    ");
+      for (int j = arSize-1; j >= 0; j--) {
+        debug.printf("%x ", oArray[i][j]); 
+      }
+      debug.printf("\n");
+    }
+  }
+}

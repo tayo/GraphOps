@@ -1,0 +1,492 @@
+/*
+ * NbrPropFilter
+ * 
+ * Takes in beginning and end pointers into the edge/replicated arrays
+ * Reads both the edge array and the replicated prop array
+ * Uses the replicated prop array values to filter the edge array values and
+ *   send those out as outputs.
+ * e.g. for BFS, check the replicated prop array depth values and output the
+ *   edge array values (nbrs) which have not been visited
+ */
+package bfs_rep_u.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.SMIO;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Mem.RamWriteMode;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.WrapMode;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.IO.*;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Stream.OffsetExpr;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.memory.Memory;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Bitops;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+import bfs_rep_u.GC;
+import bfs_rep_u.blocks.*;
+
+// Sends requests for prop elements (BFS levels)
+
+public class NbrPropFilter extends Kernel {
+
+  // return value is select control of mux
+  private DFEVar prArb(int width, DFEVar req, DFEVar base) {
+    DFEVar doubleReq = (req # req).cast(dfeUInt(2*width));
+    DFEVar diff = doubleReq - base.cast(dfeUInt(2*width));
+    DFEVar doubleGrant = doubleReq & ~diff;
+    DFEVar grant = doubleGrant.slice(0, width) | doubleGrant.slice(width, width);
+    return grant; // return value can be RawBits, so no need to cast
+    //return grant.cast(dfeUInt(width));
+  }
+
+  private void printArray(DFEVar ctrl, DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf(ctrl, "%d ", ar[size-1-i]); 
+    }
+  }
+  //hexadecimal
+  private void printArrayHex(DFEVar ctrl, DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf(ctrl, "%x ", ar[size-1-i]); 
+    }
+  }
+
+  public NbrPropFilter(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(64);
+    // Scalar Inputs
+    DFEVar repAddr  = io.scalarInput("repAddr" , dfeUInt(GC.scalWidth));
+    DFEVar uDVal    = io.scalarInput("uDVal"   , dfeUInt(GC.scalWidth));
+
+    // Types
+    int arSize = GC.PKTWIDTH/GC.EDGEWIDTH; 
+    DFEType edgeType    = dfeUInt(GC.edgeWidth); //24
+    DFEType propType    = dfeUInt(GC.PROPWIDTH); 
+    DFEType ePtrType    = dfeUInt(GC.ePtrWidth);
+    DFEType parentType  = dfeUInt(GC.nodeWidth);
+    // propType48: [[24-bit edge] [24-bit prop]]
+    DFEType propType48  = dfeUInt(GC.EDGEWIDTH); //48
+    DFEArrayType<DFEVar> arrayType = new DFEArrayType<DFEVar>(propType48, arSize);
+
+    // Inputs from BVCReader
+    NonBlockingInput<DFEVar> curLvl_In =
+      io.nonBlockingInput("curLvl", propType, constant.var(true), 1,
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar curLvl = Reductions.streamHold(curLvl_In.data, curLvl_In.valid,
+                                          propType.encodeConstant(0));
+
+    // Inputs from EdgeReader
+    int ptrDataWidth = GC.nodeWidth + GC.numPktsBits + 2*GC.ePtrWidth;
+    NonBlockingInput<DFEVar> edgePtrData_In =
+      io.nonBlockingInput("repPtrData", dfeRawBits(ptrDataWidth), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar edgePtrData = edgePtrData_In.data;
+    DFEVar edgePtrCtrl = edgePtrData_In.valid;
+    DFEVar edgePtr0_In = edgePtrData.slice(0, GC.ePtrWidth).cast(ePtrType);
+    DFEVar edgePtr1_In = edgePtrData.slice(GC.ePtrWidth, GC.ePtrWidth).cast(ePtrType);
+    DFEVar edgeNumPkts = 
+      edgePtrData.slice(2*GC.ePtrWidth, GC.numPktsBits).cast(dfeUInt(GC.numPktsBits));
+    //DFEVar parent_In =
+    //  edgePtrData.slice(2*GC.ePtrWidth+GC.numPktsBits, GC.nodeWidth).cast(parentType);
+
+    // Inputs from DRAM  
+    // replicated property arrays of the nbr
+    NonBlockingInput<DFEArray<DFEVar>> repArray_In = 
+      io.nonBlockingInput("repArray", arrayType, constant.var(true), 1,
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEArray<DFEVar> repArray = repArray_In.data;
+    DFEVar repArrayCtrl       = repArray_In.valid;
+
+    // Feedback stall input
+    NonBlockingInput<DFEVar> outputStall_In =
+      io.nonBlockingInput("outputStall", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar outputStall = Reductions.streamHold(outputStall_In.data, outputStall_In.valid,
+                                               dfeBool().encodeConstant(false));
+
+    // Queue Reader SM
+    // for each elemIdx, tracks how many packets need to be consumed before
+    // incrementing the RAM read pointer
+    SMIO ctrlSM = addStateMachine("PropFilterCtrl", 
+                                  new QRdrPktCntSM(this, GC.numPktsBits, 
+                                  GC.edgeIdxRamDepth)); 
+    ctrlSM.connectInput("numPktsVal", edgePtrCtrl);
+    ctrlSM.connectInput("numPkts"   , edgeNumPkts);
+    ctrlSM.connectInput("pktVal"    , repArrayCtrl);
+    DFEVar incRamRdPtr = ctrlSM.getOutput("incRdPtr");
+    DFEVar pktCnt      = ctrlSM.getOutput("pktCnt");
+    //accumulate the stall backpressure with all downstream stall signals
+    //rising and falling of this signal controls when backpressure is propagated
+    DFEVar inputStall  = ctrlSM.getOutput("stall") | outputStall;
+
+    // FIFOs
+    Count.Params ramRdPtrParams = control.count.makeParams(GC.ePtrRamDepthBits) //RdPtr
+        .withEnable(incRamRdPtr); 
+    Count.Params ramWrPtrParams = control.count.makeParams(GC.ePtrRamDepthBits) //WrPtr
+        .withEnable(edgePtrCtrl); 
+    DFEVar ramRdPtr = (control.count.makeCounter(ramRdPtrParams)).getCount();
+    DFEVar ramWrPtr = (control.count.makeCounter(ramWrPtrParams)).getCount();
+    //edgePtr0 FIFO
+    Memory <DFEVar> edgePtr0Ram = mem.alloc( ePtrType, GC.ePtrRamDepth);
+    edgePtr0Ram.write(ramWrPtr, edgePtr0_In , edgePtrCtrl);
+    DFEVar edgePtr0 = edgePtr0Ram.read(ramRdPtr);
+    //edgePtr1 FIFO
+    Memory <DFEVar> edgePtr1Ram = mem.alloc( ePtrType, GC.ePtrRamDepth);
+    edgePtr1Ram.write(ramWrPtr, edgePtr1_In , edgePtrCtrl);
+    DFEVar edgePtr1 = edgePtr1Ram.read(ramRdPtr); 
+    //parent FIFO -- removing to alleviate space constraints
+    //Memory <DFEVar> parentRam = mem.alloc( parentType, GC.ePtrRamDepth);
+    //parentRam.write(ramWrPtr, parent_In, edgePtrCtrl);
+    //DFEVar parent = parentRam.read(ramRdPtr);
+
+
+    ////////////////////////////////////////////////////
+    // Data Fifos
+    // fifos for storing repArray data elements
+    // --repFifos and edgeFifos don't need to be very big.  rep arrays and edge
+    //   arrays are requested at the same rate and should not be too far out of
+    //   sync in response
+
+    /*
+    // RepArray FIFOs
+    SMIO [] repFifo  = new SMIO[arSize];
+    //DFEVar[] repFifoOutputs = new DFEVar[arSize];
+    //no need for "Avail" signal -- use procPkt from the ctrl unit?
+    //perhaps still need available signal so that fifos are only read when the
+    //data has reached the output stage
+        //DFEArrayType<DFEVar> boolArray = new DFEArrayType<DFEVar>(dfeBool(), arSize);
+        //DFEArray<DFEVar> repAvail = boolArray.newInstance(this);
+    DFEVar[] repAvail = new DFEVar[arSize];
+    // fltrRes[i] is 1 if the corresponding edge should be propagated
+    // for BFS, fltrRes=1 if repFifo[i]'s BFS level is higher than curLvl+1
+    DFEVar[] fltrRes = new DFEVar[arSize];
+    for (int i = 0; i < arSize; i++) {
+      repFifo[i] = addStateMachine("repFifo"+i,
+                                   new FifoKernelSM(this, GC.PROPWIDTH, 
+                                                    GC.propFltrRamDepth));
+      repFifo[i].connectInput("dataIn" , repArray[i].slice(0,GC.PROPWIDTH).cast(propType));
+      repFifo[i].connectInput("dataVal", repArrayCtrl);
+      repFifo[i].connectInput("readEn" , procPkt);
+      //repFifoOutputs[i] = repFifo[i].getOutput("dataOut");
+      repAvail[i] = repFifo[i].getOutput("dataRdy");
+
+      // Generate masks
+      firstPktVal[i] = (firstPkt & (i >= elem0)); 
+      lastPktVal[i] = (lastPkt & (i <= elem1)); 
+      onlyPktVal[i] = (onlyPkt & (i >= elem0) & (i <= elem1));
+      pktMask[i] = midPkt | firstPktVal[i] | lastPktVal[i] | onlyPktVal[i];
+
+      // Filter result for active elements
+      fltrRes[i] = pktMask[i] & (repFifo[i].getOutput("dataOut") > (curLvl+1));
+      //fltrRes[i] = pktMask[i] & repFifo[i].getOutput("dataOut").eq(-1);
+    }
+
+    // EdgeArray FIFOs
+    SMIO [] edgeFifo  = new SMIO[arSize];
+    DFEVar[] edgeFifoOutputs = new DFEVar[arSize];
+    //no need for "Avail" signal -- use procPkt from the ctrl unit?
+    //perhaps still need available signal so that fifos are only read when the
+    //data has reached the output stage
+        //DFEArray<DFEVar> edgeAvail = boolArray.newInstance(this);
+    DFEVar[] edgeAvail = new DFEVar[arSize];
+    for (int i = 0; i < arSize; i++) {
+      edgeFifo[i] = addStateMachine("edgeFifo"+i,
+                                   new FifoKernelSM(this, GC.EDGEWIDTH,
+                                                    GC.propFltrRamDepth));
+      edgeFifo[i].connectInput("dataIn" , edgeArray[i]);
+      edgeFifo[i].connectInput("dataVal", edgeArrayCtrl);
+      edgeFifo[i].connectInput("readEn" , procPkt);
+      edgeFifoOutputs[i] = edgeFifo[i].getOutput("dataOut");
+      edgeAvail[i] = edgeFifo[i].getOutput("dataRdy");
+    }
+    
+    // okay to use the 0th value -- should be same for all.  written pkt-wise
+    DFEVar fifoDataAvail = repAvail[0] & edgeAvail[0];
+    fifosRdy <== stream.offset(fifoDataAvail, -fifosRdyLoopLen);
+    */
+
+    ////////////////////////////////////////////////////
+    // Generate a mask of which fifo data elements are active
+    DFEVar[] pktMask = new DFEVar[arSize];
+
+    int numBits = GC.ePBBits+GC.brstNbits > GC.ePtrWidth ? 
+                    GC.ePtrWidth-GC.ePBBits : GC.brstNbits; //19
+    DFEVar edgeBrst0 = edgePtr0.slice(GC.ePBBits, numBits).cast(dfeUInt(numBits));
+    DFEVar edgeBrst1 = edgePtr1.slice(GC.ePBBits, numBits).cast(dfeUInt(numBits));
+
+    DFEType pktCntType = dfeUInt(GC.numPktsBits);
+    int buf = GC.numPktsBits - GC.pktsPBBits;
+    DFEVar edgePkt0Raw = constant.var(dfeUInt(buf), 0) #  //cannot cast small to big
+                           edgePtr0.slice(GC.ePPBits, GC.pktsPBBits);
+    DFEVar edgePkt0 = edgePkt0Raw.cast(pktCntType);
+    DFEVar edgePkt1off = constant.var(dfeUInt(buf), 0) # 
+                           edgePtr1.slice(GC.ePPBits, GC.pktsPBBits);
+    DFEVar edgePkt1base = (edgeBrst1 - edgeBrst0) << GC.pktsPBBits;
+    DFEVar edgePkt1 = edgePkt1off.cast(pktCntType) + edgePkt1base.cast(pktCntType);
+    // pktMask should only be asserted when processing a packet (procPkt)
+    DFEVar midPkt   = repArrayCtrl & (pktCnt > edgePkt0) & (pktCnt < edgePkt1);
+    DFEVar onePkt   = repArrayCtrl & edgePkt0.eq(edgePkt1);
+    DFEVar firstPkt = repArrayCtrl & pktCnt.eq(edgePkt0) & ~onePkt; 
+    DFEVar lastPkt  = repArrayCtrl & pktCnt.eq(edgePkt1) & ~onePkt;
+    DFEVar onlyPkt  = repArrayCtrl & onePkt & pktCnt.eq(edgePkt0);
+    DFEVar elem0 = (edgePtr0.slice(0, GC.ePPBits)).cast(dfeUInt(GC.ePPBits));
+    DFEVar elem1 = (edgePtr1.slice(0, GC.ePPBits)).cast(dfeUInt(GC.ePPBits));
+    DFEVar[] firstPktVal = new DFEVar[arSize];
+    DFEVar[] lastPktVal = new DFEVar[arSize];
+    DFEVar[] onlyPktVal = new DFEVar[arSize];
+
+    // Outgoing Nbr FIFOs
+    // these fifos are result of filtered nbrs.  use the fltrRes mask to
+    // determine which nbrs are written into these fifos
+    SMIO [] outNbrFifo = new SMIO[arSize];
+    OffsetExpr rdEnLoopLen = stream.makeOffsetAutoLoop("rdEnLoopLen");
+    DFEVar rdEn = dfeRawBits(arSize).newInstance(this);
+    DFEVar[] outNbrOutputs = new DFEVar[arSize];
+    DFEArrayType<DFEVar> boolArray =
+      new DFEArrayType<DFEVar>(dfeBool(), arSize);
+    DFEArray<DFEVar> outNbrAvail  = boolArray.newInstance(this);
+    DFEVar nbrToSend = edgeType.newInstance(this);
+    DFEVar emitNbr   = ~outputStall;
+
+    // fltrRes[i] is 1 if the corresponding edge should be propagated
+    // for BFS, fltrRes=1 if repl data BFS level is higher than curLvl+1
+    DFEVar[] fltrRes = new DFEVar[arSize];
+
+    for (int i = 0; i < arSize; i++) {
+      // Generate masks
+      firstPktVal[i] = (firstPkt & (i >= elem0)); 
+      lastPktVal[i] = (lastPkt & (i <= elem1)); 
+      onlyPktVal[i] = (onlyPkt & (i >= elem0) & (i <= elem1));
+      pktMask[i] = midPkt | firstPktVal[i] | lastPktVal[i] | onlyPktVal[i];
+
+      // Filter result for active elements
+      DFEVar repValEdge = repArray[i].slice(0, GC.PROPWIDTH).cast(propType);
+      DFEVar repValProp = repArray[i].slice(GC.PROPWIDTH, GC.PROPWIDTH).cast(propType);
+      fltrRes[i] = pktMask[i] & (repValProp > (curLvl+1));
+
+      outNbrFifo[i] = addStateMachine("OutNbrFifo"+i,
+                                      new FifoKernelSM(this, GC.edgeWidth,
+                                                       GC.propReqRamDepth));
+      outNbrFifo[i].connectInput("dataIn" , repValEdge);
+      outNbrFifo[i].connectInput("dataVal", fltrRes[i]);
+      outNbrFifo[i].connectInput("readEn" , emitNbr & rdEn.slice(i).cast(dfeBool()));
+      outNbrOutputs[i] = outNbrFifo[i].getOutput("dataOut");
+      outNbrAvail[i] <== outNbrFifo[i].getOutput("dataRdy");
+    }
+
+    DFEVar tmpBaseCnt = control.count.simpleCounter(GC.ePPBits);
+    DFEVar arbBaseCnt = constant.var(dfeUInt(arSize), 1) << tmpBaseCnt;
+    DFEVar arbReq = outNbrAvail.pack();
+    rdEn <== prArb(arSize, stream.offset(arbReq, -rdEnLoopLen), arbBaseCnt);
+    nbrToSend <== control.oneHotMux(rdEn, outNbrOutputs);
+    DFEVar muxVal = (arbReq & rdEn).cast(dfeUInt(arSize)) > 0; 
+    DFEVar nbrToSendVal = muxVal & emitNbr;
+
+
+
+    // Visited Bitmap
+    // Try with visited bitmap here..
+
+
+
+    // Determine when the kernel has finished processing for this curLvl
+    DFEVar edgePtrCtrl_d = stream.offset(edgePtrCtrl, -1); //avoid blip with first elem
+    DFEVar begun = Reductions.streamHold(edgePtrCtrl_d, edgePtrCtrl_d,
+                                         dfeBool().encodeConstant(false));
+    DFEVar emptyRam = ramRdPtr.eq(ramWrPtr);
+    DFEVar emptyReqs = arbReq.eq(0);
+    DFEVar knlDone = begun & emptyRam & emptyReqs;
+    DFEVar knlDonePrev = stream.offset(knlDone, -1);
+
+    //DFEVar sendDone = knlDone & ~knlDonePrev;
+    DFEVar doneVal  = knlDone &  knlDonePrev;
+    Count.Params sendDoneParams = control.count.makeParams(32)
+      .withEnable(doneVal);
+    DFEVar sendDoneCnt = (control.count.makeCounter(sendDoneParams)).getCount();
+    DFEVar sendLength = uDVal*2;
+    DFEVar sendDone = knlDone & (sendDoneCnt < sendLength);
+
+    // Output to LvlUpdater: nbr to update
+    io.output("nbrNum"    , nbrToSend, edgeType, nbrToSendVal);
+
+    // Output to MemUnits: request repArray 
+    DFEType reqAddrType      = dfeUInt(GC.brstNbits);
+    DFEType reqSizeType      = dfeUInt(GC.sizeBits);
+    DFEVar repAddrBase       = repAddr.cast(reqAddrType);
+    int addrBuf = GC.brstNbits-numBits; // assumes pPBBits+brstNbits > ePtrWidth
+    DFEVar zeros = constant.var(dfeUInt(addrBuf),0);
+    DFEVar brstNum0_InRaw    = edgePtr0_In.slice(GC.ePBBits, numBits);
+    DFEVar brstNum0_In       = (zeros#brstNum0_InRaw).cast(reqAddrType);
+    DFEVar brstNum1_InRaw    = edgePtr1_In.slice(GC.ePBBits, numBits);
+    DFEVar brstNum1_In       = (zeros#brstNum1_InRaw).cast(reqAddrType);
+    DFEVar repBrsts          = brstNum1_In-brstNum0_In+1;
+    DFEVar req_size_rep      = repBrsts.cast(reqSizeType);
+    DFEVar req_brst_addr_rep = repAddrBase + brstNum0_In;
+    DFEVar req_en_rep        = edgePtrCtrl;
+    io.output("memReqRep", req_size_rep#req_brst_addr_rep#req_en_rep,
+              dfeRawBits(GC.memReqWidth));
+
+    // Outputs to BVN_Writer
+    io.output("idle", knlDone, dfeBool(), sendDone); //, constant.var(true)); 
+
+    // Stall feedback:  flow control to previous unit
+    DFEVar inputStallD = stream.offset(inputStall, -1);
+    DFEVar startStall  = inputStall & ~inputStallD;
+    DFEVar stopStall   = ~inputStall & inputStallD;
+    io.output("stall", inputStall, dfeBool(), startStall|stopStall);
+
+    /*
+    /////////////////////////////////////////
+    // Debug -- Scalar Outputs
+
+    DFEVar pPSeen = Reductions.streamHold(constant.var(true), procPkt,
+                                          dfeBool().encodeConstant(false));
+    DFEVar pPtrig = pPSeen & ~stream.offset(pPSeen, -1);
+    //DFEVar firstProcPkt = pktCnt.eq(0) & procPkt;
+    DFEVar pPC = Reductions.streamHold(cnt, pPtrig,
+                                         dfeUInt(64).encodeConstant(false));
+
+    DFEVar fltrResSeen = Reductions.streamHold(constant.var(true), fltrRes[0],
+                                               dfeBool().encodeConstant(false));
+    DFEVar fRtrig = fltrResSeen & ~stream.offset(fltrResSeen, -1);
+    DFEVar fRC = Reductions.streamHold(cnt, fRtrig,
+                                       dfeUInt(64).encodeConstant(0));
+
+    //DFEVar nbrToSendSeen = Reductions.streamHold(constant.var(true), nbrToSendVal,
+    //                                             dfeBool().encodeConstant(false));
+    //DFEVar nTStrig = nbrToSendSeen & ~stream.offset(nbrToSendSeen, -1);
+    //DFEVar nTS = Reductions.streamHold(nbrToSend, nTStrig, 
+    //                                    edgeType.encodeConstant(0));
+    //DFEVar nTSC = Reductions.streamHold(cnt, nTStrig,
+    //                                    dfeUInt(64).encodeConstant(0));
+    //DFEVar nT = nTSC.slice(0,32) # nTS.slice(0,32);
+
+    // pack: edgeFifoOutputs 3-0 (16-bits each)
+    // pack: zeros(16-bits # fltrResPack(16-bits) # fRC(32-bits)
+    DFEVar fltrResPack = fltrRes[15]#fltrRes[14]#fltrRes[13]#fltrRes[12]#
+                         fltrRes[11]#fltrRes[10]#fltrRes[ 9]#fltrRes[ 8]#
+                         fltrRes[ 7]#fltrRes[ 6]#fltrRes[ 5]#fltrRes[ 4]#
+                         fltrRes[ 3]#fltrRes[ 2]#fltrRes[ 1]#fltrRes[ 0];
+    DFEVar fltrResAr = Reductions.streamHold(fltrResPack, fRtrig,
+                                             dfeRawBits(16).encodeConstant(0));
+    DFEVar fltrResPPC = Reductions.streamHold(fltrResPack, pPtrig,
+                                              dfeRawBits(16).encodeConstant(0));
+    DFEVar fR = fltrResPPC # fltrResAr # fRC.slice(0,32);
+
+    DFEVar e3 = edgeFifoOutputs[3].slice(0,16);
+    DFEVar e2 = edgeFifoOutputs[2].slice(0,16);
+    DFEVar e1 = edgeFifoOutputs[1].slice(0,16);
+    DFEVar e0 = edgeFifoOutputs[0].slice(0,16);
+    DFEVar fREInputs = e3 # e2 # e1 # e0;
+    DFEVar fRE = Reductions.streamHold(fREInputs.cast(dfeUInt(64)), fRtrig,
+                                       dfeUInt(64).encodeConstant(0));
+
+    // count edgeArrayCtrl signals
+    Count.Params eACP = control.count.makeParams(32)
+      .withEnable(edgeArrayCtrl);
+    DFEVar eACnt = (control.count.makeCounter(eACP)).getCount();
+    DFEVar eA3 = edgeArray[3].slice(0,16);
+    DFEVar eA2 = edgeArray[2].slice(0,16);
+    DFEVar eA1 = edgeArray[1].slice(0,16);
+    DFEVar eA0 = edgeArray[0].slice(0,16);
+    DFEVar eARaw = eA3 # eA2 # eA1 # eA0;
+    // incoming edges during pkt0 and pkt1
+    DFEVar firstEAC = edgeArrayCtrl & eACnt.eq(0);
+    DFEVar secEAC   = edgeArrayCtrl & eACnt.eq(1);
+    DFEVar eA_pkt0 = Reductions.streamHold(eARaw.cast(dfeUInt(64)), firstEAC,
+                                           dfeUInt(64).encodeConstant(0));
+    DFEVar eA_pkt1 = Reductions.streamHold(eARaw.cast(dfeUInt(64)), secEAC,
+                                           dfeUInt(64).encodeConstant(0));
+    //one cycle after procPkt
+    DFEVar pPtrig_p1 = stream.offset(pPtrig, -1);
+    DFEVar eO_PPCp1 = Reductions.streamHold(fREInputs.cast(dfeUInt(64)), pPtrig_p1,
+                                            dfeUInt(64).encodeConstant(0));
+    // edgeFifoOutputs at various points
+    //during first edgeArrayCtrl
+    DFEVar eO_eAC0 = Reductions.streamHold(fREInputs.cast(dfeUInt(64)), firstEAC,
+                                           dfeUInt(64).encodeConstant(0));
+    //one cycle before edgeArrayCtrl
+    DFEVar eO_eACP1 = Reductions.streamHold(fREInputs.cast(dfeUInt(64)), 
+                                            stream.offset(firstEAC, 1),
+                                            dfeUInt(64).encodeConstant(0));
+    //2 cycles before edgeArrayCtrl
+    DFEVar eO_eACP2 = Reductions.streamHold(fREInputs.cast(dfeUInt(64)), 
+                                            stream.offset(firstEAC, 2),
+                                            dfeUInt(64).encodeConstant(0));
+    //3 cycles before edgeArrayCtrl
+    DFEVar eO_eACP3 = Reductions.streamHold(fREInputs.cast(dfeUInt(64)), 
+                                            stream.offset(firstEAC, 3),
+                                            dfeUInt(64).encodeConstant(0));
+    //@ cycle number 1 (early in the execution)
+    DFEVar eO_cycle1 = Reductions.streamHold(fREInputs.cast(dfeUInt(64)), 
+                                            cnt.eq(1),
+                                            dfeUInt(64).encodeConstant(0));
+    //cycle when edgeFifoOutputs gets its value
+    Count.Params vSP = control.count.makeParams(32)
+      .withEnable(e0.cast(dfeUInt(16)).eq(412));
+    DFEVar valsCnt = (control.count.makeCounter(vSP)).getCount();
+    DFEVar firstVals = e0.cast(dfeUInt(16)).eq(412) & valsCnt.eq(0);
+    DFEVar vC = Reductions.streamHold(cnt, firstVals,
+                                      dfeUInt(64).encodeConstant(0));
+                                           
+    io.scalarOutput("scalarOut_0", pPC, dfeUInt(64));
+    io.scalarOutput("scalarOut_1", fR.cast(dfeUInt(64)), dfeUInt(64));
+    io.scalarOutput("scalarOut_2", fRE, dfeUInt(64));
+    io.scalarOutput("scalarOut_3", eA_pkt0               , dfeUInt(64));
+    io.scalarOutput("scalarOut_4", eA_pkt1               , dfeUInt(64));
+    io.scalarOutput("scalarOut_5", eO_eAC0               , dfeUInt(64));
+    io.scalarOutput("scalarOut_6", eO_eACP1              , dfeUInt(64));
+    io.scalarOutput("scalarOut_7", eO_eACP2              , dfeUInt(64));
+    io.scalarOutput("scalarOut_8", eO_eACP3              , dfeUInt(64));
+    io.scalarOutput("scalarOut_9", eO_cycle1             , dfeUInt(64));
+    io.scalarOutput("scalarOut_a", vC                    , dfeUInt(64));
+    /////////////////////////////////////////
+    */
+
+    // debug
+    debug.printf("NbrPropFilter: cnt=%d, pktCnt=%d, repAddr=%d, curLvl=%d, outputStall=%d, inputStall=%d\n", 
+      cnt, pktCnt, repAddr, curLvl, outputStall, inputStall);
+    debug.printf(edgePtrCtrl, "    ePtrCtrl=%d, ePtr0_In=%d, ePtr1_In=%d, parent_In=n/a\n",  
+      edgePtrCtrl, edgePtr0_In, edgePtr1_In);
+    debug.printf("    ePtr0=%d, ePtr1=%d, ramRdPtr=%d, incRd=%d, ramWrPtr=%d\n",
+      edgePtr0, edgePtr1, ramRdPtr, incRamRdPtr, ramWrPtr);
+    debug.printf("    repArrayCtrl=%d, repArray = ", repArrayCtrl);
+      printArrayHex(repArrayCtrl, repArray.elementsAsArray(), arSize); 
+      debug.printf(repArrayCtrl, "\n");
+    debug.printf("    [Fifo] numPkts_In=%d, numPktsVal=%d, incRd=%d, pktCnt=%d\n", 
+      edgeNumPkts, edgePtrCtrl, incRamRdPtr, pktCnt);
+    debug.printf("    edgePtr0=%d, brst0=%d, pkt0=%d, edgePtr1=%d, brst1=%d, pkt1=%d\n",
+      edgePtr0, edgeBrst0, edgePkt0, edgePtr1, edgeBrst1, edgePkt1);
+    debug.printf("    pktMask=");
+      for (int i = 0; i < arSize; i++) debug.printf("%d ", pktMask[arSize-1-i]);
+    debug.printf("    fltrRes=");
+      for (int i = 0; i < arSize; i++) debug.printf("%d ", fltrRes[arSize-1-i]);
+      debug.printf("\n");
+    debug.printf("    outNbrAvail=  "); 
+      printArray(constant.var(true), outNbrAvail.elementsAsArray(), arSize); debug.printf("\n");
+    debug.printf("    outNbrOutputs=  ");
+      printArray(constant.var(true), outNbrOutputs, arSize); debug.printf("\n");
+    debug.printf("    outNbrRdEn (arb output)=%o\n", rdEn);
+    debug.printf("    done: begun=%d, emptyRam=%d, emptyReqs=%d\n",
+      begun, emptyRam, emptyReqs);
+    debug.printf("    knlDone=%d, doneVal=%d, sendDoneCnt=%d, sendDone=%d\n",
+      knlDone, doneVal, sendDoneCnt, sendDone);
+    debug.printf("    nbrToSend=%d, nbrToSendVal=%d\n",
+      nbrToSend, nbrToSendVal);
+    debug.printf("    req_en=%d, brstNum0_In=%d, brstNum1_In=%d, repBrsts=%d, reqAddrRep=%d\n",
+      edgePtrCtrl, brstNum0_In, brstNum1_In, repBrsts, req_brst_addr_rep);
+    //debug.printf("    parent=%d, edgeToRead=%d, emit=%d\n", //, req_brst_addr=%d\n", 
+    //  elemToProc.slice(24,24), elemToProc.slice(0,24), emit); //, brstToReq);
+    //debug.printf("    Bitmap: bmAddr=%d, edgeToRdVal=%d, visited=%d, emit=%d\n",
+    //  bmAddr, procVal, visited, emit);
+    //debug.printf("    Bitmap: initCnt=%d, initDone=%d\n",
+    //  bmInitCnt, bmInitDone);
+
+    flush.onTrigger(constant.var(false));
+  }
+}

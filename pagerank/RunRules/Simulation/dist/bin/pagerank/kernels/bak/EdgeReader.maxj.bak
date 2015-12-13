@@ -1,0 +1,151 @@
+package graph_accel.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.SMIO;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.memory.Memory;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import graph_accel.GC;
+
+public class EdgeReader extends Kernel {
+
+  private void printArray(DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf("%d ", ar[size-1-i]); 
+    }
+  }
+
+  public EdgeReader(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(32);
+    // Scalar Inputs
+    DFEVar edgeAddr = io.scalarInput("edgeAddr", dfeUInt(GC.scalWidth));
+
+    // Inputs from DRAM:  node lists
+    int arSize = GC.NODESPERPKT;
+    DFEArrayType<DFEVar> arrayType = 
+      new DFEArrayType<DFEVar>(dfeUInt(GC.NODEWIDTH), arSize);
+    //DFEArray<DFEVar> nodeArray = io.input("nodeArray", arrayType);
+    DFEVar nodeArrayCtrl = io.input("nodeArrayCtrl", dfeBool());
+    DFEArray<DFEVar> nodeArray = io.input("nodeArray", arrayType, nodeArrayCtrl);
+
+    // Inputs from NodeReader:  index into edge lists
+    DFEVar elemIdxCtrl  = io.input("elemIdxCtrl", dfeBool());
+    DFEVar elemIdx_In = io.input("elemIdx", dfeUInt(GC.nPBBits), elemIdxCtrl);
+    // Inputs from BVCReader
+    DFEVar clrDone = io.input("clrDone", dfeBool());
+
+    // Queue Reader SM
+    // - for each elemIdx, tracks how many packets need to be consumed before
+    //   incrementing the RAM read pointer
+    // - flexible approach is needed to account for overflow (receive 2 bursts)
+    int buf = 2;
+    int pktCntBits = GC.pktsPBBits+buf;  // Allow space for multiple bursts
+    DFEType pktCntType = dfeUInt(pktCntBits);
+      int lastNodeInBrstIdx = GC.NODESPERBRST-1;
+      DFEVar ovflow_In = elemIdx_In.eq(lastNodeInBrstIdx);
+      DFEVar iNumPkts  = ~ovflow_In ? constant.var(pktCntType, GC.PKTSPERBRST)
+                                   : constant.var(pktCntType, 2*GC.PKTSPERBRST);
+    SMIO ctrlSM = addStateMachine("EdgeReaderCtrl", new QRdrPktCntSM(this, pktCntBits));
+    ctrlSM.connectInput("pktVal",     nodeArrayCtrl);
+    ctrlSM.connectInput("numPkts",    iNumPkts);
+    ctrlSM.connectInput("numPktsVal", elemIdxCtrl);
+    DFEVar incRamRdPtr = ctrlSM.getOutput("incRdPtr");
+    DFEVar pktCnt      = ctrlSM.getOutput("pktCnt");
+
+    /*
+    // Counter for tracking incoming packets
+    //   set num bits to pktsPBBits+1 (need to handle 2 brsts if ovflow)
+    //DFEVar resetPktCnt = ~ovflowPrev & pktCnt.eq(GC.PKTSPERBRST-1);
+    Count.Params pktCntParams = control.count.makeParams(GC.pktsPBBits)
+        //.withReset(resetPktCnt)     // reset early if rec'd 1 burst and !ovflow
+        .withEnable(nodeArrayCtrl); // only increment if valid data packet
+    Counter pktCounter = control.count.makeCounter(pktCntParams);
+    DFEVar pktCnt = pktCounter.getCount(); 
+    */
+    
+    // ElemIdx FIFO
+    //   Stores queue of elemIdx's to use when processing incoming edge lists
+    //   Pop the queue when all associated packets have been processed
+    //DFEVar incRamRdPtr = pktCounter.getWrap(); 
+      //pktCnt.eq(GC.PKTSPERBRST-1)&nodeArrayCtrl;
+      // TODO: OR counter reset (~ovflow & got one brst)
+    Count.Params ramRdPtrParams = control.count.makeParams(GC.eIdxRamDepthBits) //RdPtr
+        .withEnable(incRamRdPtr);
+    Count.Params ramWrPtrParams = control.count.makeParams(GC.eIdxRamDepthBits) //WrPtr
+        .withEnable(elemIdxCtrl);
+    Counter ramRdPtrCounter = control.count.makeCounter(ramRdPtrParams);
+    Counter ramWrPtrCounter = control.count.makeCounter(ramWrPtrParams);
+    DFEVar ramRdPtr = ramRdPtrCounter.getCount();
+    DFEVar ramWrPtr = ramWrPtrCounter.getCount();
+    Memory <DFEVar> elemIdxRam = mem.alloc( dfeUInt(GC.nPBBits), GC.elemIdxRamDepth);
+    elemIdxRam.write(ramWrPtr, elemIdx_In, elemIdxCtrl);
+    DFEVar elemIdx = elemIdxRam.read(ramRdPtr);
+
+    // Determine when the kernel has finished processing for this curLvl
+    DFEVar begun = Reductions.streamHold(elemIdxCtrl, 
+                                         elemIdxCtrl | clrDone,
+                                         dfeBool().encodeConstant(false));
+    DFEVar emptyRam = ramRdPtr.eq(ramWrPtr);
+    DFEVar knlDone = begun & emptyRam;
+    
+    DFEVar elemIdxP1  = elemIdx+1;
+    DFEVar ovflow     = elemIdxP1.eq(0);
+    DFEVar pktRawBits = constant.var(dfeUInt(buf), 0) # 
+                        elemIdxP1.slice(GC.nPPBits, GC.pktsPBBits);
+    DFEVar elemPkt = ~ovflow ? pktRawBits.cast(pktCntType)
+                             : constant.var(pktCntType, GC.PKTSPERBRST);
+    DFEVar thisPkt = elemPkt.eq(pktCnt); //request emitted during this pkt's cycle
+
+    //DFEVar elemP1_pkt = (elemIdxP1.slice(GC.nPPBits, GC.pktsPBBits)).cast(dfeUInt(GC.pktsPBBits));
+    DFEVar elem_mux_sel   = elemIdx.slice(0, GC.nPPBits);
+    DFEVar elemP1_mux_sel = elemIdxP1.slice(0, GC.nPPBits);
+    
+    DFEVar newPkt  = elemP1_mux_sel.eq(0);
+    DFEVar ptr0Array  = control.mux(elem_mux_sel, nodeArray.elementsAsArray());
+    DFEVar edgePtr0   = ~newPkt ? ptr0Array : stream.offset(ptr0Array, -1);
+    DFEVar edgePtr1P1 = control.mux(elemP1_mux_sel, nodeArray.elementsAsArray());
+    DFEVar edgePtr1   = edgePtr1P1 - 1;
+    
+    // Outputs to MemUnit
+    DFEType reqAddrType = dfeUInt(GC.brstNbits);
+    DFEType reqSizeType = dfeUInt(GC.sizeBits);
+    DFEVar edgeBrst0 = edgePtr0.slice(GC.nPBBits, GC.brstNbits).cast(reqAddrType);
+    DFEVar edgeBrst1 = edgePtr1.slice(GC.nPBBits, GC.brstNbits).cast(reqAddrType);
+    DFEVar edgeAddrBase = edgeAddr.cast(reqAddrType);
+    DFEVar req_size  = (edgeBrst1 - edgeBrst0 + 1).cast(reqSizeType);
+    DFEVar req_en    = thisPkt & nodeArrayCtrl;
+    DFEVar req_brst_addr = edgeBrst0+edgeAddrBase;
+    io.output("req_brst_addr", req_brst_addr, reqAddrType);
+    io.output("req_size"     , req_size,      reqSizeType);
+    io.output("req_en"       , req_en,        dfeBool());
+    // Outputs to LvlReader
+    io.output("edgePtrCtrl", req_en, dfeBool());
+    io.output("edgePtr0", edgePtr0.cast(dfeUInt(GC.ePtrWidth)), dfeUInt(GC.ePtrWidth), req_en);
+    io.output("edgePtr1", edgePtr1.cast(dfeUInt(GC.ePtrWidth)), dfeUInt(GC.ePtrWidth), req_en);
+    io.output("edgePkts", (edgeBrst1-edgeBrst0+1)<<GC.pktsPBBits, reqAddrType, req_en);
+    // Outputs to BVN_Writer
+    io.output("edgeRdrIdle", knlDone, dfeBool());
+
+    // debug
+    debug.printf("EdgeReader: cnt=%d, pktCnt=%d, edgeAddr=%d\n", cnt, pktCnt, edgeAddr);
+    debug.printf("    eIdxEn=%d, eIdx_In=%d, eIdx=%d, wrPtr=%d, rdPtr=%d\n",
+        elemIdxCtrl, elemIdx_In, elemIdx, ramWrPtr, ramRdPtr);
+    debug.printf("    inArCtrl=%d, edgePtr0=%d, edgePtr1=%d, edgePtrCtrl=%d\n",
+				nodeArrayCtrl, edgePtr0, edgePtr1, req_en);
+    debug.printf("    nodeArray = "); printArray(nodeArray.elementsAsArray(), arSize);
+    debug.printf("\n");
+    debug.printf("    [pkts] incRd=%d, ovflow=%d, hotPkt=%d, req_addr=%d, req_size=%d\n", 
+       incRamRdPtr, ovflow, elemPkt, req_brst_addr, req_size);
+    debug.printf("    thisPkt=%d, edgeBrst0=%d, edgeBrst1=%d, begun=%d, emptyRam=%d\n", 
+        thisPkt, edgeBrst0, edgeBrst1, begun, emptyRam);
+    
+    flush.onTrigger(constant.var(false));
+  }
+}

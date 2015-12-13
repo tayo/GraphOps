@@ -1,0 +1,120 @@
+package pagerank.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.IO.*;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+//import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import pagerank.GC;
+
+/*
+ * EndSignal: Accumulates the idle signal and sends the endSignal interrupt
+ * memory request when the system is done.
+ * - Use counter based system to ensure that inputs are stable
+ */   
+
+public class EndSignal extends Kernel {
+
+  public EndSignal(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(64);
+    // Scalar Inputs
+    DFEVar dbgStopCnt = io.scalarInput("StopCnt" , dfeUInt(64));
+    DFEVar uDVal    = io.scalarInput("uDVal"   , dfeUInt(32));
+
+    // this dummy input is never used.  try making it smaller than a full packet
+    int arSize = GC.NODESPERPKT;
+    DFEArrayType<DFEVar> arrayType = 
+      new DFEArrayType<DFEVar>(dfeUInt(GC.NODEWIDTH), arSize);
+    NonBlockingInput<DFEArray<DFEVar>> dummyArray_In = 
+      io.nonBlockingInput("dummyArray", arrayType, constant.var(true), 1,
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEArray<DFEVar> dummyArray = dummyArray_In.data;
+
+    // Calculating frontier done and global done
+    NonBlockingInput<DFEVar> edgeRdrD_In =
+      io.nonBlockingInput("edgeRdrIdle", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+      // counter to ensure that the "done" signal is stable
+      Count.Params edgeDParams = control.count.makeParams(32)
+        .withEnable(edgeRdrD_In.valid & edgeRdrD_In.data)
+        .withReset(edgeRdrD_In.valid & ~edgeRdrD_In.data);
+      DFEVar edgeDCnt = (control.count.makeCounter(edgeDParams)).getCount();
+      DFEVar edgeDVal = edgeDCnt.eq(uDVal);
+    DFEVar edgeRdrD = Reductions.streamHold(edgeDVal, 
+                                            edgeDVal | (edgeRdrD_In.valid & ~edgeRdrD_In.data),
+                                            dfeBool().encodeConstant(false));
+
+
+    NonBlockingInput<DFEVar> lvlRdrD_In =
+      io.nonBlockingInput("lvlRdrIdle", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+      // counter to ensure that the "done" signal is stable
+      Count.Params lvlDParams = control.count.makeParams(32)
+        .withEnable(lvlRdrD_In.valid & lvlRdrD_In.data)
+        .withReset(lvlRdrD_In.valid & ~lvlRdrD_In.data);
+      DFEVar lvlDCnt = (control.count.makeCounter(lvlDParams)).getCount();
+      DFEVar lvlDVal = lvlDCnt.eq(uDVal);
+    DFEVar lvlRdrD = Reductions.streamHold(lvlDVal, 
+                                           lvlDVal | (lvlRdrD_In.valid & ~lvlRdrD_In.data),
+                                           dfeBool().encodeConstant(false));
+
+    NonBlockingInput<DFEVar> lvlUpdD_In =
+      io.nonBlockingInput("lvlUpdIdle", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+      // counter to ensure that the "done" signal is stable
+      Count.Params updDParams = control.count.makeParams(32)
+        .withEnable(lvlUpdD_In.valid & lvlUpdD_In.data)
+        .withReset(lvlUpdD_In.valid & ~lvlUpdD_In.data);
+      DFEVar updDCnt = (control.count.makeCounter(updDParams)).getCount();
+      DFEVar updDVal = updDCnt.eq(uDVal);
+    DFEVar lvlUpdD = Reductions.streamHold(updDVal, 
+                                           updDVal | (lvlUpdD_In.valid & ~lvlUpdD_In.data),
+                                           dfeBool().encodeConstant(false));
+
+    // If unitsDone, emit enough packets to complete the current burst
+    DFEVar unitsD = edgeRdrD & lvlRdrD & lvlUpdD;
+
+    // Saturating counter -- only declare done after unitsD high for a large
+    // number of cycles
+    Count.Params uDCParams = control.count.makeParams(32)
+      .withEnable(unitsD)
+      .withReset(~unitsD);
+    DFEVar uDCnt = (control.count.makeCounter(uDCParams)).getCount();
+    DFEVar uDFull = uDCnt.eq(uDVal);
+    // signal for resetting unitsDone
+    DFEVar uDEndVal = uDVal*2;
+    DFEVar uDEnd    = uDCnt.eq(uDEndVal);
+    DFEVar unitsDone = Reductions.streamHold(uDFull , uDFull|uDEnd, 
+                                  dfeBool().encodeConstant(false));
+    DFEVar unitsDPrev = stream.offset(unitsDone, -1);
+    DFEVar donePulse = unitsDone & ~unitsDPrev;
+
+
+    DFEVar endSignal = donePulse ; 
+
+
+    // Emit end-signal request when ready
+    DFEType reqAddrType = dfeUInt(GC.brstNbits);
+    DFEType reqSizeType = dfeUInt(GC.sizeBits);
+    DFEVar req_brst_addr = constant.var(reqAddrType, 1<<27);
+    DFEVar req_size = constant.var(reqSizeType, 1);
+    DFEVar req_en = endSignal|cnt.eq(dbgStopCnt);
+    io.output("memReq", req_size#req_brst_addr#req_en, dfeRawBits(GC.memReqWidth));
+
+    
+    // Debug
+    debug.printf("EndSignal: cnt=%d\n", cnt);
+    debug.printf("    Done: edgeRd=%d(cnt=%d),lvlRd=%d(cnt=%d),unitsD=%d(cnt=%d),unitsDone=%d\n",
+      edgeRdrD, edgeDCnt, lvlRdrD, lvlDCnt, unitsD, uDCnt, unitsDone);
+    debug.printf("    endSignal=%d, req_en=%d, req_brst_addr=%d, req_size=%d\n", 
+      endSignal, req_en, req_brst_addr, req_size);
+
+    flush.onTrigger(constant.var(false));
+  }
+}

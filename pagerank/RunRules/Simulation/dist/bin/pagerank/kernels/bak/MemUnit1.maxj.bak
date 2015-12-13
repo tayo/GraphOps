@@ -1,0 +1,47 @@
+package graph_accel.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.LMemCommandStream;
+import graph_accel.GC;
+
+public class MemUnit1 extends Kernel {
+
+  public MemUnit1(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(32);
+    // Enable flag -- turns the kernel on/off
+    DFEVar en = io.scalarInput("en", dfeBool());
+
+    DFEVar memReq = io.input("memReq", dfeRawBits(GC.memReqWidth));
+    DFEVar req_en = memReq.slice(0).cast(dfeBool());
+    DFEVar req_brst_addr = memReq.slice(1, GC.brstNbits).cast(dfeUInt(GC.brstNbits));
+    DFEVar req_size = memReq.slice(GC.brstNbits+1, GC.sizeBits).cast(dfeUInt(GC.sizeBits));
+    //DFEVar req_brst_addr = io.input("req_brst_addr", dfeUInt(GC.brstNbits));
+    //DFEVar req_size = io.input("req_size", dfeUInt(GC.sizeBits));
+    //DFEVar req_en = io.input("req_en", dfeBool());
+
+    // Interrupt signalling final memory request: Addr = 1<<27, Size=255
+    DFEVar interrupt_tag = req_brst_addr.eq(1<<27) & req_size.eq(1);
+
+        // Debug: Burst count output to RSM to tell it how many packets to expect
+        //io.output("oSize", req_size, dfeUInt(GC.sizeBits), req_en);
+
+    // Read command
+    LMemCommandStream.makeKernelOutput
+      ("cmd_rd",                        // stream name
+       req_en & en,                     // ctrl
+       req_brst_addr,                   // addr (burst number)
+       req_size,                        // size
+       constant.var(dfeUInt(7), 1),     // inc
+       constant.var(dfeUInt(4), 0),     // stream
+       interrupt_tag);                  // tag
+
+    // debug
+    debug.printf(req_en, "MemUnit1: cnt=%d, req_en=%d, en=%d, burst_addr=%d, size=%d\n", 
+                  cnt, req_en, en, req_brst_addr, req_size);
+
+    flush.onTrigger(constant.var(false));
+  }
+}

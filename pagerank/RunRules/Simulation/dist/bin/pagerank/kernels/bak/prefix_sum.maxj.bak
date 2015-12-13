@@ -1,0 +1,59 @@
+
+// Used in BVNWriter
+
+/*
+// Prefix sum:  This will be used to compact the updated neighbors for storing
+DFEVar[] x0 = new DFEVar[GC.PROPPERBRST]; // <-- can do in-place on the bit-vec?
+DFEVar[] t  = new DFEVar[GC.PROPPERBRST]; // temp values for downsweep swapping
+int bitVecCnt = MathUtils.bitsToAddress(GC.PROPPERBRST);
+
+  for (int i = 0; i < GC.PROPPERBRST; i++) 
+    x0[i] = (constant.var(dfeUInt(bitVecCnt-1),0) # updNbrsBitVec.slice(i, 1)).
+      cast(dfeUInt(bitVecCnt));
+
+  // Upsweep / Reduce phase -- only for 64-bit bit-vectors
+  for (int i = 0; i < GC.PROPPERBRST; i+=2) 
+    x0[i+1] = x0[i+1] + x0[i];
+  for (int i = 0; i < GC.PROPPERBRST; i+=4) 
+    x0[i+3] = x0[i+3] + x0[i+1];
+  for (int i = 0; i < GC.PROPPERBRST; i+=8) 
+    x0[i+7] = x0[i+7] + x0[i+3];
+  for (int i = 0; i < GC.PROPPERBRST; i+=16) 
+    x0[i+15] = x0[i+15] + x0[i+7];
+  for (int i = 0; i < GC.PROPPERBRST; i+=32) 
+    x0[i+31] = x0[i+31] + x0[i+15];
+  for (int i = 0; i < GC.PROPPERBRST; i+=64) 
+    x0[i+63] = x0[i+63] + x0[i+31];
+
+  // Downsweep phase
+  x0[63] = constant.var(x0[0].getType(), 0);
+  for (int i = 0; i < GC.PROPPERBRST; i+=64) {
+    t[i] = x0[i+31]; x0[i+31] = x0[i+63]; x0[i+63] = t[i] + x0[i+63];
+  }
+  for (int i = 0; i < GC.PROPPERBRST; i+=32) {
+    t[i] = x0[i+15]; x0[i+15] = x0[i+31]; x0[i+31] = t[i] + x0[i+31];
+  }
+  for (int i = 0; i < GC.PROPPERBRST; i+=16) {
+    t[i] = x0[i+ 7]; x0[i+ 7] = x0[i+15]; x0[i+15] = t[i] + x0[i+15];
+  }
+  for (int i = 0; i < GC.PROPPERBRST; i+= 8) {
+    t[i] = x0[i+ 3]; x0[i+ 3] = x0[i+ 7]; x0[i+ 7] = t[i] + x0[i+ 7];
+  }
+  for (int i = 0; i < GC.PROPPERBRST; i+= 4) {
+    t[i] = x0[i+ 1]; x0[i+ 1] = x0[i+ 3]; x0[i+ 3] = t[i] + x0[i+ 3];
+  }
+  for (int i = 0; i < GC.PROPPERBRST; i+= 2) {
+    t[i] = x0[i+ 0]; x0[i+ 0] = x0[i+ 1]; x0[i+ 1] = t[i] + x0[i+ 1];
+  }
+
+int arSize = GC.NODESPERPKT;
+// Populate outgoing arrays
+DFEVar numUpd = x0[63]; // number of elements updated in incoming burst
+//DFEVar placePos = Reductions.streamHold(
+// If current array placePosition + numUpd > arSze, then 
+// for bvCnt: 
+// 1. Increment running bvCnt with numUpd.
+// 2. Track number of bursts sent.  Then at last burst, use the last pre-fix
+//    sum to calculate number of valid elements in that burst.  Then do math to
+//    calculate the total number of elements.
+*/

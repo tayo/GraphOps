@@ -1,0 +1,5 @@
+#
+# This file is managed by MaxIDE. Do NOT change.
+#
+HEADERS:= PagerankCpuCode.h  bfs.h  graph_gen.h edge_list_input.h
+SOURCES:= PagerankCpuCode.c  bfs.c  graph_gen.c edge_list_input.c

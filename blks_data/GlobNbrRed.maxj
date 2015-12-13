@@ -1,0 +1,527 @@
+/*
+ * Reduction Kernel
+ * Configuration:
+ * 
+ * nullValue:  change, depending on the type of reduction (0 for +, 1 for *, etc)
+ * redResult:  change to reflect the computation being performed
+ *             for the simple case, simple addition of incoming nbr properties
+ */
+package v_cover_u.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.SMIO;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Mem.RamWriteMode;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.WrapMode;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.IO.*;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Stream.OffsetExpr;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.memory.Memory;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Bitops;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Accumulator;
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+import v_cover_u.GC;
+import v_cover_u.blocks.*;
+
+public class GlobNbrRed extends Kernel {
+
+  // return value is select control of mux
+  private DFEVar prArb(int width, DFEVar req, DFEVar base) {
+    DFEVar doubleReq = (req # req).cast(dfeUInt(2*width));
+    DFEVar diff = doubleReq - base.cast(dfeUInt(2*width));
+    DFEVar doubleGrant = doubleReq & ~diff;
+    DFEVar grant = doubleGrant.slice(0, width) | doubleGrant.slice(width, width);
+    return grant; // return value can be RawBits, so no need to cast
+    //return grant.cast(dfeUInt(width));
+  }
+
+  private void printArray(DFEVar ctrl, DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf(ctrl, "%d ", ar[size-1-i]); 
+    }
+  }
+
+  // printRep:  Takes in full 48-bit rep value (including edge)
+  private void printRep(DFEVar ctrl, DFEVar rep) {
+    int degWidth=8;
+    int covDegWidth = 12;
+    DFEVar nbr  = rep.slice(0, covDegWidth*2);
+    DFEVar prop = rep.slice(covDegWidth*2, covDegWidth*2);
+    DFEVar curCov = prop.slice(degWidth, 1).cast(dfeBool());
+    DFEVar parCov = prop.slice(covDegWidth+degWidth, 1).cast(dfeBool());
+    DFEVar curDeg = prop.slice(0, degWidth);
+    DFEVar parDeg = prop.slice(covDegWidth, degWidth);
+    debug.printf(ctrl, "%d:(%d,d=%d)|(%d,d=%d) ", 
+                  nbr, parCov, parDeg, curCov, curDeg);
+  }
+  private void printArrayRep(DFEVar ctrl, DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      printRep(ctrl, ar[size-1-i]); 
+    }
+  }
+
+  // printProp:  Takes in only 24-bit prop values (not including edge)
+  private void printProp(DFEVar ctrl, DFEVar prop) {
+    int degWidth=8;
+    int covDegWidth = 12;
+    DFEVar curCov = prop.slice(degWidth, 1).cast(dfeBool());
+    DFEVar parCov = prop.slice(covDegWidth+degWidth, 1).cast(dfeBool());
+    DFEVar curDeg = prop.slice(0, degWidth);
+    DFEVar parDeg = prop.slice(covDegWidth, degWidth);
+    debug.printf(ctrl, "(%d,d=%d)|(%d,d=%d) ", 
+                  parCov, parDeg, curCov, curDeg);
+  }
+  private void printArrayProp(DFEVar ctrl, DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      printProp(ctrl, ar[size-1-i]); 
+    }
+  }
+
+  // kernel of v_cover:  max of sum of degrees
+  // Takes in 24-bit rep value (not including edge)
+  private DFEVar reduceOp(DFEVar x, DFEVar y) {
+    int degWidth = 8;
+    int covDegWidth = 12;
+    DFEType degType = dfeUInt(degWidth);
+
+    DFEVar xParDeg = x.slice(covDegWidth, degWidth).cast(degType);
+    DFEVar xCurDeg = x.slice(0, degWidth).cast(degType);
+    DFEVar yParDeg = y.slice(covDegWidth, degWidth).cast(degType);
+    DFEVar yCurDeg = y.slice(0, degWidth).cast(degType);
+
+    DFEVar res = (yParDeg+yCurDeg > xParDeg+xCurDeg) ? y : x;
+    return res;
+  }
+
+  public GlobNbrRed(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(64);
+    // Scalar Inputs
+    DFEVar uDVal  = io.scalarInput("uDVal"   , dfeUInt(32));
+    DFEVar repAddr  = io.scalarInput("repAddr" , dfeUInt(GC.scalWidth));
+
+    // Types
+    int arSize = GC.PKTWIDTH/GC.PROPWIDTH; 
+    // propType48: [[12-bit parent property] [12-bit cur property   ]][ edge ]
+    //              [4-bit cov | 8-bit deg ] [4-bit cov |  8-bit deg] [24-bit]
+    DFEType propType48  = dfeUInt(GC.PROPWIDTH);
+    int edgeWidth = 24;  DFEType edgeType = dfeUInt(edgeWidth);
+    int repWidth = 24;
+    int covDegWidth = 12;
+    int degWidth = 8;    DFEType degType = dfeUInt(degWidth);
+    DFEArrayType<DFEVar> arrayType = new DFEArrayType<DFEVar>(propType48, arSize);
+    DFEType ePtrType = dfeUInt(GC.ePtrWidth);
+    DFEType parentType = dfeUInt(GC.nodeWidth);
+
+    // Inputs from Reader
+    int parentWidth = 32;  //equal to numNodesWidth in ForAllPropRdr
+    int ptrDataWidth = parentWidth + GC.numPktsBits + 2*GC.ePtrWidth;
+    NonBlockingInput<DFEVar> ptrData_In =
+      io.nonBlockingInput("ptrData", dfeRawBits(ptrDataWidth), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar edgePtrData = ptrData_In.data;
+    DFEVar edgePtrCtrl = ptrData_In.valid;
+    DFEVar edgePtr0_In = edgePtrData.slice(0, GC.ePtrWidth).cast(ePtrType);
+    DFEVar edgePtr1_In = edgePtrData.slice(GC.ePtrWidth, GC.ePtrWidth).cast(ePtrType);
+    DFEVar edgeNumPkts = 
+      edgePtrData.slice(2*GC.ePtrWidth, GC.numPktsBits).cast(dfeUInt(GC.numPktsBits));
+    DFEVar parent_In =  
+      edgePtrData.slice(2*GC.ePtrWidth+GC.numPktsBits, GC.nodeWidth).cast(parentType);
+
+
+    // Inputs from DRAM
+    // replicated property arrays 
+    NonBlockingInput<DFEArray<DFEVar>> propArray_In = 
+      io.nonBlockingInput("repArray", arrayType, constant.var(true), 1,
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEArray<DFEVar> repArray = propArray_In.data;
+    DFEVar repArrayCtrl           = propArray_In.valid;
+
+
+    // Queue Reader SM
+    // * for each elemIdx, tracks how many packets need to be consumed before
+    // incrementing the RAM read pointer
+    SMIO ctrlSM = addStateMachine("CtrlSM", 
+                                  new QRdrPktCntSM(this, GC.numPktsBits,
+                                  GC.propFltrRamDepth));
+    ctrlSM.connectInput("numPktsVal", edgePtrCtrl);
+    ctrlSM.connectInput("numPkts",    edgeNumPkts);
+    ctrlSM.connectInput("pktVal",     repArrayCtrl);
+    DFEVar incRamRdPtr = ctrlSM.getOutput("incRdPtr");
+    DFEVar pktCnt      = ctrlSM.getOutput("pktCnt");
+    DFEVar inputStall  = ctrlSM.getOutput("stall");
+
+    // FIFOs
+    Count.Params ramRdPtrParams = control.count.makeParams(GC.ePtrRamDepthBits) //RdPtr
+        .withEnable(incRamRdPtr); 
+    Count.Params ramWrPtrParams = control.count.makeParams(GC.ePtrRamDepthBits) //WrPtr
+        .withEnable(edgePtrCtrl); 
+    DFEVar ramRdPtr = (control.count.makeCounter(ramRdPtrParams)).getCount();
+    DFEVar ramWrPtr = (control.count.makeCounter(ramWrPtrParams)).getCount();
+    //parent FIFO
+    Memory <DFEVar> parentRam = mem.alloc( parentType, GC.ePtrRamDepth);
+    parentRam.write(ramWrPtr, parent_In, edgePtrCtrl);
+    DFEVar parent = parentRam.read(ramRdPtr);
+    //edgePtr0 FIFO
+    Memory <DFEVar> edgePtr0Ram = mem.alloc( ePtrType, GC.ePtrRamDepth);
+    edgePtr0Ram.write(ramWrPtr, edgePtr0_In , edgePtrCtrl);
+    DFEVar edgePtr0 = edgePtr0Ram.read(ramRdPtr);
+    //edgePtr1 FIFO
+    Memory <DFEVar> edgePtr1Ram = mem.alloc( ePtrType, GC.ePtrRamDepth);
+    edgePtr1Ram.write(ramWrPtr, edgePtr1_In , edgePtrCtrl);
+    DFEVar edgePtr1 = edgePtr1Ram.read(ramRdPtr);  // edgePtr-1 (subtract prev kernel)
+
+    int numBits = GC.ePBBits+GC.brstNbits > GC.ePtrWidth ? 
+                GC.ePtrWidth-GC.ePBBits : GC.brstNbits;
+    DFEVar edgeBrst0 = edgePtr0.slice(GC.ePBBits, numBits).cast(dfeUInt(numBits));
+    DFEVar edgeBrst1 = edgePtr1.slice(GC.ePBBits, numBits).cast(dfeUInt(numBits));
+
+    
+    /*
+    //////////////////////////////////////////////////////////
+    // Data Fifos
+    // fifos for storing repArray data elements
+    // --repFifos and edgeFifos don't need to be very big.  they are used only
+    //   as temporary holding buffers rep arrays and edge arrays are requested
+    //   at the same rate and should not be too far out of sync in response
+    int fifoDepth = 1024;
+
+    // RepArray FIFOs
+    SMIO [] repFifo  = new SMIO[arSize];
+    DFEVar[] fltrRes = new DFEVar[arSize];
+    DFEVar[] repFifoOutputs = new DFEVar[arSize];
+    for (int i = 0; i < arSize; i++) {
+      repFifo[i] = addStateMachine("repFifo"+i,
+                                   new FifoKernelSM(this, GC.PROPWIDTH, 
+                                                    fifoDepth));
+      repFifo[i].connectInput("dataIn" , repArray[i]);
+      repFifo[i].connectInput("dataVal", repArrayCtrl);
+      repFifo[i].connectInput("readEn" , procPkt);
+      repFifoOutputs[i] = repFifo[i].getOutput("dataOut");
+
+      // From v_cover kernel: only perform reduction if either parent or current
+      // node are uncovered (p.cov==0 or c.cov==0)
+      DFEVar repElem = repFifo[i].getOutput("dataOut");
+      DFEVar curCov = repElem.slice(degWidth, 1).cast(dfeBool());
+      DFEVar parCov = repElem.slice(24+degWidth, 1).cast(dfeBool());
+      //DFEVar curDeg = repElem.slice(0, degWidth);
+      //DFEVar parDeg = repElem.slice(24, degWidth);
+
+      fltrRes[i] = ~(curCov & parCov);
+    }
+
+    // EdgeArray FIFOs
+    SMIO [] edgeFifo  = new SMIO[arSize];
+    DFEVar[] edgeFifoOutputs = new DFEVar[arSize];
+    for (int i = 0; i < arSize; i++) {
+      edgeFifo[i] = addStateMachine("edgeFifo"+i,
+                                   new FifoKernelSM(this, GC.EDGEWIDTH,
+                                                    fifoDepth));
+      edgeFifo[i].connectInput("dataIn" , edgeArray[i]);
+      edgeFifo[i].connectInput("dataVal", edgeArrayCtrl);
+      edgeFifo[i].connectInput("readEn" , procPkt);
+      edgeFifoOutputs[i] = edgeFifo[i].getOutput("dataOut");
+      //Avail <== repFifo[i].getOutput("dataRdy"); // no need for avail
+    }
+    //////////////////////////////////////////////////////////
+    */
+
+
+    // Generate a mask of which incoming data elements are active
+    //DFEVar[] pktMask = new DFEVar[arSize];
+    DFEArrayType<DFEVar> boolArray = new DFEArrayType<DFEVar>(dfeBool(), arSize);
+    DFEArray<DFEVar> pktMask = boolArray.newInstance(this);
+
+    DFEType pktCntType = dfeUInt(GC.numPktsBits);
+    int buf = GC.numPktsBits - GC.pktsPBBits;
+    DFEVar edgePkt0Raw = constant.var(dfeUInt(buf), 0) #  //cannot cast small to big
+                           edgePtr0.slice(GC.ePPBits, GC.pktsPBBits);
+    DFEVar edgePkt0 = edgePkt0Raw.cast(pktCntType);
+    DFEVar edgePkt1off = constant.var(dfeUInt(buf), 0) # 
+                           edgePtr1.slice(GC.ePPBits, GC.pktsPBBits);
+    DFEVar edgePkt1base = (edgeBrst1 - edgeBrst0) << GC.pktsPBBits;
+    DFEVar edgePkt1 = edgePkt1off.cast(pktCntType) + edgePkt1base.cast(pktCntType);
+    // pktMask should only be asserted when data is arriving (edgePtrCtrl)
+    DFEVar midPkt   = repArrayCtrl & (pktCnt > edgePkt0) & (pktCnt < edgePkt1);
+    DFEVar onePkt   = repArrayCtrl & edgePkt0.eq(edgePkt1);
+    DFEVar firstPkt = repArrayCtrl & pktCnt.eq(edgePkt0) & ~onePkt; 
+    DFEVar lastPkt  = repArrayCtrl & pktCnt.eq(edgePkt1) & ~onePkt;
+    DFEVar onlyPkt  = repArrayCtrl & onePkt & pktCnt.eq(edgePkt0);
+    DFEVar elem0 = (edgePtr0.slice(0, GC.ePPBits)).cast(dfeUInt(GC.ePPBits));
+    DFEVar elem1 = (edgePtr1.slice(0, GC.ePPBits)).cast(dfeUInt(GC.ePPBits));
+    DFEVar[] firstPktVal = new DFEVar[arSize];
+    DFEVar[] lastPktVal = new DFEVar[arSize];
+    DFEVar[] onlyPktVal = new DFEVar[arSize];
+
+    DFEVar[] arrayElem = new DFEVar[arSize];
+    DFEVar[] fltrRes = new DFEVar[arSize]; // boolean: whether or not to process result
+    int reduceElemWidth = repWidth + GC.pPPBits;  // space for arrayID
+    DFEType rElemType = dfeRawBits(reduceElemWidth);
+    //nullValue will depend on the reduction operation
+    DFEVar nullValue = constant.var(rElemType, 0);  // zeros for the degrees
+    for (int i = 0; i < arSize; i++) {
+      // Generate masks
+      firstPktVal[i] = (firstPkt & (i >= elem0)); 
+      lastPktVal[i] = (lastPkt & (i <= elem1)); 
+      onlyPktVal[i] = (onlyPkt & (i >= elem0) & (i <= elem1));
+      //pktMask[i] = midPkt | firstPktVal[i] | lastPktVal[i] | onlyPktVal[i];
+      pktMask[i] <== midPkt | firstPktVal[i] | lastPktVal[i] | onlyPktVal[i];
+
+      // remember to account for the nbr/edge in lowest 24 bits
+      DFEVar curCov = repArray[i].slice(edgeWidth+degWidth, 1).cast(dfeBool());
+      DFEVar parCov = repArray[i].slice(edgeWidth+covDegWidth+degWidth, 1).cast(dfeBool());
+      // filter based on cov values
+      fltrRes[i] = ~(curCov & parCov) & pktMask[i];
+
+      DFEVar arrayId = constant.var(dfeUInt(GC.pPPBits), i);
+      // include value in computation if valid elem (pktMask) and passes v_cover
+      // conditional statement (fltrRes)
+      arrayElem[i] = fltrRes[i] ? 
+                     arrayId # repArray[i].slice(edgeWidth, repWidth) : 
+                     nullValue;
+    }
+    
+    //reduction result: 
+    DFEVar redResult =
+    reduceOp(
+      reduceOp(
+        reduceOp(  reduceOp(arrayElem[15],arrayElem[14]),   reduceOp(arrayElem[13],arrayElem[12])  ),
+        reduceOp(  reduceOp(arrayElem[11],arrayElem[10]),   reduceOp(arrayElem[ 9],arrayElem[ 8])  )
+      ),
+      reduceOp(
+        reduceOp(  reduceOp(arrayElem[ 7],arrayElem[ 6]),   reduceOp(arrayElem[ 5],arrayElem[ 4])  ),
+        reduceOp(  reduceOp(arrayElem[ 3],arrayElem[ 2]),   reduceOp(arrayElem[ 1],arrayElem[ 0])  )
+      )
+    );
+
+    // extract the accompanying edge of a new reduceOp winner
+    DFEVar resArrayIdx = redResult.slice(repWidth, GC.pPPBits).cast(dfeUInt(GC.pPPBits));
+    DFEVar resEdgeRep = control.mux(resArrayIdx, repArray.elementsAsArray());
+    DFEVar resEdge = resEdgeRep.slice(0, edgeWidth).cast(edgeType);
+
+    // calculate the edge idx of the new reduceOp winner
+      //edge and prop are same size
+    DFEVar edgeIdx0 = edgePtr0.slice(0, GC.ePPBits).cast(dfeUInt(GC.ePPBits)); 
+    DFEVar case0 = pktCnt.eq(edgePkt0);
+      DFEVar idxDiff = (resArrayIdx-edgeIdx0).cast(ePtrType);
+      DFEVar edgeId_0 = edgePtr0 + idxDiff;
+    DFEVar case1 = pktCnt.eq(edgePkt0+1);
+      DFEVar prevPkt = constant.var(ePtrType, arSize) - edgeIdx0.cast(ePtrType);
+      DFEVar offset = prevPkt + resArrayIdx.cast(ePtrType);
+      DFEVar edgeId_1 = edgePtr0 + offset;
+    DFEVar case2 = pktCnt > (edgePkt0+1);
+      DFEVar bufEntries = ((pktCnt-edgePkt0-1)*arSize).cast(ePtrType);
+      DFEVar edgeId_2 = edgePtr0 + offset + bufEntries;
+    DFEVar edgeId = case0 ? edgeId_0 : 
+                      case1 ? edgeId_1 : edgeId_2;
+
+    DFEVar newPktsThisCycle = pktMask.pack().cast(dfeUInt(arSize));
+    DFEVar thisPkt = newPktsThisCycle > 0;
+
+    /*
+     * Scheme for reduction in presence of long latency:
+     * Use N registers to accumulate all candidates for max.  If thisPkt is high
+     * and the redResult is greater than the curResult, then update one of the N
+     * registers.  Use a counter to determine which one.  Reduce the N registers
+     * every cycle to get the next max.
+     * - Basic loop-based approach does not work because of long latency to
+     * update the max value.
+     */
+    int numRedRegs = 4;   // try with N=4 registers
+    int redRegsBits = MathUtils.bitsToAddress(numRedRegs);
+
+    OffsetExpr regLoopLen = stream.makeOffsetAutoLoop("regLoopLen");
+    DFEVar regResDelayed = rElemType.newInstance(this);
+    DFEVar resVsReg = reduceOp(redResult, regResDelayed);
+    DFEVar storeInRegs = thisPkt & resVsReg.eq(redResult);
+    Count.Params redRegsCntParams = control.count.makeParams(redRegsBits)
+      .withEnable(storeInRegs);
+    DFEVar regCnt = (control.count.makeCounter(redRegsCntParams)).getCount();
+
+    DFEVar redReg0 = Reductions.streamHold(redResult, storeInRegs & regCnt.eq(0),
+                                           rElemType.encodeConstant(0));
+    DFEVar redReg1 = Reductions.streamHold(redResult, storeInRegs & regCnt.eq(1),
+                                           rElemType.encodeConstant(0));
+    DFEVar redReg2 = Reductions.streamHold(redResult, storeInRegs & regCnt.eq(2),
+                                           rElemType.encodeConstant(0));
+    DFEVar redReg3 = Reductions.streamHold(redResult, storeInRegs & regCnt.eq(3),
+                                           rElemType.encodeConstant(0));
+    DFEVar regResult = reduceOp( reduceOp(redReg0,redReg1), 
+                                 reduceOp(redReg2,redReg3) );
+    regResDelayed <== stream.offset(regResult, -regLoopLen);
+
+    OffsetExpr resultLoopLen = stream.makeOffsetAutoLoop("resultLoopLen");
+    DFEVar accResult = rElemType.newInstance(this);
+      // compare the current reduction entry with the previous accumululated result
+      DFEVar tmpResult = reduceOp(accResult, regResult);
+      // determine if the current entry results in a new winner
+      DFEVar tmpResultInt = tmpResult.cast(dfeUInt(reduceElemWidth));
+      DFEVar redResultInt = redResult.cast(dfeUInt(reduceElemWidth));
+      //comparing rawBits seems to be resulting in incorrect results, so try ints
+      DFEVar newResult = storeInRegs & tmpResultInt.eq(redResultInt);
+    DFEVar curResult = Reductions.streamHold(regResult, newResult,
+                                             rElemType.encodeConstant(0));
+    accResult <== stream.offset(curResult, -resultLoopLen);
+
+////////
+//Scalar Outupts
+    // V_Cover parameter "to": capture from edgeFifoOutputs using arrayId, if new result
+    DFEVar curEdge = Reductions.streamHold(resEdge, newResult, 
+                                           edgeType.encodeConstant(0));
+
+
+    // V_Cover parameter "max_val": calculate the v_cover value (deg + parent's deg)
+    //                              to export to host 
+    DFEVar curCurDeg = curResult.slice(0, degWidth).cast(degType);
+    DFEVar curParDeg = curResult.slice(covDegWidth, degWidth).cast(degType);
+    DFEVar curVal = curCurDeg + curParDeg;
+
+    // V_Cover parameter "from": extract from head of the parent FIFO and export to host
+    DFEVar curParent = Reductions.streamHold(parent, newResult,
+                                             parentType.encodeConstant(0));
+
+    // V_Cover parameter "e": edge index: calculate using pktCnt, arrayId, and
+    DFEVar curEdgeId = Reductions.streamHold(edgeId, newResult,
+                                             ePtrType.encodeConstant(0));
+
+    io.scalarOutput("scalarOut_0", curVal, degType);
+    io.scalarOutput("scalarOut_1", curEdge, edgeType);
+    io.scalarOutput("scalarOut_2", curParent, parentType);
+    io.scalarOutput("scalarOut_3", curEdgeId, ePtrType);
+////////
+
+
+    // Determine when the kernel has finished processing for this curLvl
+    DFEVar edgePtrCtrl_d = stream.offset(edgePtrCtrl, -1); //avoid blip with first elem
+    DFEVar begun = Reductions.streamHold(edgePtrCtrl_d, edgePtrCtrl_d,
+                                         dfeBool().encodeConstant(false));
+    DFEVar emptyRam = ramRdPtr.eq(ramWrPtr);
+    DFEVar knlDone = begun & emptyRam;
+    DFEVar knlDonePrev = stream.offset(knlDone, -1);
+
+    //DFEVar sendDone = knlDone & ~knlDonePrev;
+    DFEVar doneVal  = knlDone &  knlDonePrev;
+    Count.Params sendDoneParams = control.count.makeParams(32)
+      .withEnable(doneVal);
+    DFEVar sendDoneCnt = (control.count.makeCounter(sendDoneParams)).getCount();
+    DFEVar sendLength = uDVal*2;
+    DFEVar sendDone = knlDone & (sendDoneCnt < sendLength);
+
+    // Outputs to BVN_Writer
+    io.output("idle", knlDone, dfeBool(), sendDone); //, constant.var(true)); 
+
+    // Output to MemUnits: request repArray 
+    DFEType reqAddrType      = dfeUInt(GC.brstNbits);
+    DFEType reqSizeType      = dfeUInt(GC.sizeBits);
+    DFEVar repAddrBase       = repAddr.cast(reqAddrType);
+    int addrBuf = GC.brstNbits-numBits; // assumes pPBBits+brstNbits > ePtrWidth
+    DFEVar zeros = constant.var(dfeUInt(addrBuf),0);
+    DFEVar brstNum0_InRaw    = edgePtr0_In.slice(GC.ePBBits, numBits);
+    DFEVar brstNum0_In       = (zeros#brstNum0_InRaw).cast(reqAddrType);
+    DFEVar brstNum1_InRaw    = edgePtr1_In.slice(GC.ePBBits, numBits);
+    DFEVar brstNum1_In       = (zeros#brstNum1_InRaw).cast(reqAddrType);
+    DFEVar repBrsts          = brstNum1_In-brstNum0_In+1;
+    DFEVar req_size_rep      = repBrsts.cast(reqSizeType);
+    DFEVar req_brst_addr_rep = repAddrBase + brstNum0_In;
+    DFEVar req_en_rep        = edgePtrCtrl;
+    io.output("memReqRep", req_size_rep#req_brst_addr_rep#req_en_rep,
+              dfeRawBits(GC.memReqWidth));
+
+    // Stall feedback:  flow control to previous unit
+    DFEVar inputStallD = stream.offset(inputStall, -1);
+    DFEVar startStall  = inputStall & ~inputStallD;
+    DFEVar stopStall   = ~inputStall & inputStallD;
+    io.output("stall", inputStall, dfeBool(), startStall|stopStall);
+
+    /*
+    // Debug: Scalar Outputs
+    DFEVar sawKD = Reductions.streamHold(knlDone, knlDone,
+                                         dfeBool().encodeConstant(false));
+    DFEVar sawKD32 = (constant.var(dfeUInt(31),0) # sawKD);
+
+    int buf32Bits = 32 - GC.ePtrRamDepthBits;
+    DFEVar rdPtr32 = (constant.var(dfeUInt(buf32Bits),0) # ramRdPtr);
+    DFEVar wrPtr32 = (constant.var(dfeUInt(buf32Bits),0) # ramWrPtr);
+
+    DFEType numPktsType = dfeUInt(GC.numPktsBits);
+    Accumulator.Params aP = Reductions.accumulator.makeAccumulatorConfig(numPktsType)
+      //.withClear(~begun)
+      .withEnable(edgePtrCtrl);
+    DFEVar numPktsReq = Reductions.accumulator.makeAccumulator(edgeNumPkts, aP);
+    DFEVar pkts32 = (constant.var(dfeUInt(16),0) # numPktsReq);
+
+    Count.Params pPCP = control.count.makeParams(32)
+      .withEnable(procPkt);
+    DFEVar pPCnt = (control.count.makeCounter(pPCP)).getCount();
+
+    Count.Params rPCP = control.count.makeParams(32)
+      .withEnable(repArrayCtrl);
+    DFEVar rPCnt = (control.count.makeCounter(rPCP)).getCount();
+
+    Count.Params ePCP = control.count.makeParams(32)
+      .withEnable(edgeArrayCtrl);
+    DFEVar ePCnt = (control.count.makeCounter(ePCP)).getCount();
+
+    DFEType t64 = dfeUInt(64);
+    io.scalarOutput("scalarOut_4", (rdPtr32#wrPtr32).cast(t64) , t64);
+    io.scalarOutput("scalarOut_5", (sawKD32#pkts32).cast(t64) , t64);
+    io.scalarOutput("scalarOut_6", (constant.var(dfeUInt(32),0)#pPCnt).cast(t64) , t64);
+    io.scalarOutput("scalarOut_7", (rPCnt#ePCnt).cast(t64) , t64);
+    */
+
+
+    DFEVar tr = constant.var(true);
+    // debug
+    debug.printf("GlobNbrRed: cnt=%d, pktCnt=%d, stall=%d\n", cnt, pktCnt, inputStall);
+    debug.printf(edgePtrCtrl, "    ePtrCtrl=%d, ePtr0_In=%d, ePtr1_In=%d, nPkts_In=%d, parent_In=%d\n",  
+      edgePtrCtrl, edgePtr0_In, edgePtr1_In, edgeNumPkts, parent_In);
+    debug.printf("    ePtr0=%d, ePtr1=%d, parent=%d, ramRdPtr=%d, incRd=%d, ramWrPtr=%d\n",
+      edgePtr0, edgePtr1, parent, ramRdPtr, incRamRdPtr, ramWrPtr);
+    debug.printf("    [Fifo] numPkts_In=%d, numPktsVal=%d, incRd=%d, pktCnt=%d\n", 
+      edgeNumPkts, edgePtrCtrl, incRamRdPtr, pktCnt);
+
+    debug.printf("    repArrayCtrl=%d, repArray = ", repArrayCtrl);
+      printArrayRep(repArrayCtrl, repArray.elementsAsArray(), arSize);
+      debug.printf(repArrayCtrl, "\n");
+    
+    debug.printf("    fltrRes=");
+      for (int i = 0; i < arSize; i++) debug.printf("%d ", fltrRes[arSize-1-i]);
+      debug.printf("\n");
+    debug.printf("    edgePkt0=%d, edgePkt1=%d, pktMask=",
+      edgePkt0, edgePkt1);
+      for (int i = 0; i < arSize; i++) debug.printf("%d ", pktMask[arSize-1-i]);
+      debug.printf("\n");
+    debug.printf("    arrayElems=  ");
+      printArrayProp(tr, arrayElem, arSize); debug.printf("\n");
+    debug.printf("    reduceResult="); printProp(tr, redResult); 
+        debug.printf("regResD="); printProp(tr, regResDelayed);
+        debug.printf("resVsReg="); printProp(tr, resVsReg);
+        debug.printf("storeInRegs=%d\n", storeInRegs);
+    debug.printf("    regCnt=%d, redRegs[3:0]: ", regCnt); printProp(tr, redReg3); 
+        printProp(tr, redReg2); printProp(tr, redReg1); printProp(tr, redReg0); 
+        debug.printf("regResult="); printProp(tr, regResult); debug.printf("\n");
+    debug.printf("    accRes="); printProp(tr, accResult); 
+        debug.printf("tmpResult="); printProp(tr, tmpResult);
+        debug.printf("curRes="); printProp(tr, curResult); debug.printf("\n");
+    debug.printf("    newResult=%d, curEdge=%d, curParent=%d, cases0,1,2=%d,%d,%d, curEdgeId=%d, ",
+      newResult, curEdge, curParent, case0, case1, case2, curEdgeId);
+      debug.printf("curVal=%d, curCurDeg=%d, curParDeg=%d\n",
+        curVal, curCurDeg, curParDeg);
+    debug.printf("    edgeIdx0=%d, resArrayIdx=%d, edgeId0=%d, edgeId1=%d, bufEntries=%d, edgeId2=%d\n",
+        edgeIdx0, resArrayIdx, edgeId_0, edgeId_1, bufEntries, edgeId_2);
+    debug.printf("    memReqRep: req_en=%d, req_brst_addr=%d, req_size=%d\n",
+      req_en_rep, req_brst_addr_rep, req_size_rep);
+    debug.printf("    done: begun=%d, emptyRam=%d\n",
+      begun, emptyRam);
+    debug.printf("    knlDone=%d, doneVal=%d, sendDoneCnt=%d, sendDone=%d\n",
+        knlDone, doneVal, sendDoneCnt, sendDone);
+
+    flush.onTrigger(constant.var(false));
+  }
+}

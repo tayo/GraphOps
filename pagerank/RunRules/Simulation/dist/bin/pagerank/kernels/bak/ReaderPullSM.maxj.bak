@@ -1,0 +1,58 @@
+/* 
+ * A Manager State Machine that handles reading from LMem and adds
+ * a control bit to incoming data.  This helps resolve flow control issues
+ * because it provides an always-valid data stream to the kernels.
+ *
+ * This version uses the Pull Output interface.
+ *   --> This fails because the system assumes that kernels run every cycle. For
+ *   example, the kernels collect expected neighbors before the data actually
+ *   comes from memory.
+ */
+
+package graph_accel.kernels;
+
+import com.maxeler.maxcompiler.v2.managers.DFEManager;
+import com.maxeler.maxcompiler.v2.statemachine.manager.DFEsmPullInput;
+import com.maxeler.maxcompiler.v2.statemachine.manager.DFEsmPullOutput;
+import com.maxeler.maxcompiler.v2.statemachine.manager.ManagerStateMachine;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateValue;
+import graph_accel.GC;
+
+
+public class ReaderPullSM extends ManagerStateMachine {
+
+  private final DFEsmPullInput dataIn;
+  private final DFEsmPullOutput dataOut;
+
+  private final DFEsmStateValue dbgCnt;
+
+  private final int id;
+  public ReaderPullSM(DFEManager owner, int id) {
+    super(owner);
+    this.id = id;
+    dataIn  = io.pullInput("dataIn", dfeUInt(GC.PKTWIDTH));
+    dataOut = io.pullOutput("dataOut", dfeUInt(GC.PKTWIDTH));
+    dbgCnt  = state.value(dfeUInt(32), 0);
+  }
+
+  @Override
+  protected void nextState() {
+    dbgCnt.next <== dbgCnt+1;
+  }
+
+  @Override
+  protected void outputFunction() {
+    // Pull Output
+    dataOut.empty <== dataIn.empty;
+    dataOut       <== dataIn;
+
+    // Pull Input
+    dataIn.read   <== dataOut.read;
+
+    //dataIn.read   <== ~dataIn.empty & ~iData.stall;
+
+    debug.printf("rsm-%d: %d: dataIn.empty=%d, dataOut.read=%d\n",
+        id, dbgCnt, dataIn.empty, dataOut.read);
+  }
+}
+

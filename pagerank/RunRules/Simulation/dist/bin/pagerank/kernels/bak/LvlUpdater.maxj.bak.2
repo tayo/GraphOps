@@ -1,0 +1,167 @@
+package graph_accel.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.IO.*;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.memory.Memory;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import graph_accel.GC;
+//import graph_accel.blocks.*;
+
+public class LvlUpdater extends Kernel {
+
+  private void printArrayHex(DFEVar ctrl, DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf(ctrl, "%x ", ar[size-1-i]); 
+    }
+  }
+
+  public LvlUpdater(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(32);
+    // Scalar Inputs
+    DFEVar propAddr = io.scalarInput("propAddr", dfeUInt(GC.scalWidth));
+
+    // Inputs from DRAM:  lvl numbers
+    int arSize = GC.PROPPERPKT;
+    DFEType propType = dfeInt(GC.PROPWIDTH);
+    DFEArrayType<DFEVar> arrayType = 
+      new DFEArrayType<DFEVar>(propType, arSize);
+    //DFEArray<DFEVar> propArray = io.input("propArray", arrayType);
+    //DFEVar propArrayCtrl = io.input("propArrayCtrl", dfeBool());
+    //DFEArray<DFEVar> propArray = io.input("propArray", arrayType, propArrayCtrl);
+    NonBlockingInput<DFEArray<DFEVar>> propArray_In = 
+      io.nonBlockingInput("propArray", arrayType, constant.var(true), 1,
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEArray<DFEVar> propArray = propArray_In.data;
+    DFEVar propArrayCtrl       = propArray_In.valid;
+
+
+    // Inputs from BVCReader
+      //DFEVar curLvl = io.input("curLvl", propType);
+    NonBlockingInput<DFEVar> curLvl_In =
+      io.nonBlockingInput("curLvl", propType, constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar curLvl = Reductions.streamHold(curLvl_In.data, curLvl_In.valid, 
+                                          propType.encodeConstant(0));
+
+      //DFEVar clrDone = io.input("clrDone", dfeBool());
+    NonBlockingInput<DFEVar> clrDone_In =
+      io.nonBlockingInput("clrDone", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar clrDone = clrDone_In.valid ? clrDone_In.data : constant.var(false);
+
+    // Inputs from LvlReader
+    DFEType edgeType = dfeUInt(GC.EDGEWIDTH);
+      //DFEVar nbrNumCtrl = io.input("nbrNumCtrl", dfeBool());
+      //DFEVar nbrNum_In = io.input("nbrNum", edgeType, nbrNumCtrl);
+    NonBlockingInput<DFEVar> nbrNum_Input =
+      io.nonBlockingInput("nbrNum", edgeType, constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar nbrNum_In  = nbrNum_Input.data;
+    DFEVar nbrNumCtrl = nbrNum_Input.valid;
+
+    // Counter for tracking incoming packets
+    int pktCntBits = GC.pktsPBBits;
+    Count.Params pktCntParams = control.count.makeParams(pktCntBits)
+      .withEnable(propArrayCtrl);
+    Counter pktCounter = control.count.makeCounter(pktCntParams);
+    DFEVar pktCnt = pktCounter.getCount();
+
+    // nbrNum Fifo
+    // TODO: This FIFO overflows ==> consider making bigger (or using parallel?)
+    Count.Params ramRdPtrParams = control.count.makeParams(GC.nbrNumRamDepthBits)
+      .withEnable(pktCounter.getWrap());
+    Count.Params ramWrPtrParams = control.count.makeParams(GC.nbrNumRamDepthBits)
+      .withEnable(nbrNumCtrl);
+    DFEVar ramWrPtr = (control.count.makeCounter(ramWrPtrParams)).getCount();
+    DFEVar ramRdPtr = (control.count.makeCounter(ramRdPtrParams)).getCount();
+    Memory <DFEVar> nbrNumRam = mem.alloc(edgeType, GC.nbrNumRamDepth);
+    nbrNumRam.write(ramWrPtr, nbrNum_In, nbrNumCtrl);
+    DFEVar nbrNum = nbrNumRam.read(ramRdPtr);
+
+    // Determine packet of interest
+    DFEVar nbrNumPktRaw = nbrNum.slice(GC.pPPBits, GC.pktsPBBits);
+    DFEVar nbrNumPkt = nbrNumPktRaw.cast(dfeUInt(pktCntBits));
+    DFEVar thisPkt = nbrNumPkt.eq(pktCnt) & propArrayCtrl;
+
+    // Process pkts and replace lvl numbers
+    DFEArray<DFEVar> propArrayOut = arrayType.newInstance(this);
+    DFEVar nbrNumIdx = nbrNum.slice(0, GC.pPPBits).cast(dfeUInt(GC.pPPBits));
+    DFEVar[] thisElem = new DFEVar[arSize];
+    DFEArrayType<DFEVar> boolArray =
+      new DFEArrayType<DFEVar>(dfeBool(), arSize);
+    DFEArray<DFEVar> unVisited = boolArray.newInstance(this);
+    DFEArray<DFEVar> update    = boolArray.newInstance(this);
+    // Optimization TODO: most significant bit of the prop = "unVisited"
+
+    for (int i = 0; i < arSize; i++) {
+      thisElem[i] = thisPkt & nbrNumIdx.eq(i);
+      unVisited[i] <== propArray[i].eq(-1);
+      update [i]   <== unVisited[i] & thisElem[i];
+      propArrayOut[i] <== update [i] ? curLvl + 1 : propArray[i];
+    }
+
+    // Outputs to BVNWriter: nbrs being updated to append to frontier
+    DFEVar updatePack = update.pack().cast(dfeUInt(arSize));
+    DFEVar updatedNbrCtrl = updatePack>0;
+      //io.output("updatedNbrCtrl", updatedNbrCtrl , dfeBool());
+    io.output("updatedNbr"    , nbrNum, edgeType, updatedNbrCtrl);
+    // Determine when the kernel has finished processing for this curLvl
+    DFEVar nbrNumCtrl_d = stream.offset(nbrNumCtrl, -1); //avoid blip with first nbrCtrl
+    DFEVar begun = Reductions.streamHold(nbrNumCtrl_d, nbrNumCtrl_d | clrDone,
+                                         dfeBool().encodeConstant(false));
+    DFEVar emptyRam = ramRdPtr.eq(ramWrPtr);
+    DFEVar noActiveData = ~propArrayCtrl;
+    DFEVar knlDone = begun & 
+                     emptyRam &
+                     noActiveData;
+    DFEVar knlDonePrev = stream.offset(knlDone, -1);
+    DFEVar sendDone = knlDone & ~knlDonePrev;
+    io.output("lvlUpdIdle", knlDone, dfeBool(), sendDone|clrDone);
+              //knlDone|(stream.offset(clrDone,-1)) );
+
+    // Output modified propArray to DRAM:  lvl numbers -- controlled output
+    io.output("propArrayMod", propArrayOut, arrayType, propArrayCtrl);  
+    
+    // Emit write request when beginning processing of a new nbrNum
+    DFEType reqAddrType = dfeUInt(GC.brstNbits);
+    DFEType reqSizeType = dfeUInt(GC.sizeBits);
+    DFEVar brstToWriteRaw = nbrNum.slice(GC.pPBBits, GC.brstNbits);
+    DFEVar brstToWrite = brstToWriteRaw.cast(reqAddrType);
+    DFEVar propAddrBase = propAddr.cast(reqAddrType);
+    DFEVar req_brst_addr = brstToWrite+propAddrBase;
+    DFEVar req_size = constant.var(dfeUInt(GC.sizeBits), 1);
+    DFEVar req_en = pktCnt.eq(0) & propArrayCtrl; //send at start of incoming brst
+    io.output("memReq", req_size#req_brst_addr#req_en, dfeRawBits(GC.memReqWidth));
+      //io.output("req_brst_addr", req_brst_addr, reqAddrType);
+      //io.output("req_size"     , req_size     , reqSizeType);
+      //io.output("req_en"       , req_en       , dfeBool());
+
+
+    //debug
+    debug.printf("LvlUpdater: cnt=%d, pktCnt=%d, nbrNumCtrl=%d, propArrayCtrl=%d, curLvl=%d, propAddr=%d\n", 
+                 cnt, pktCnt, nbrNumCtrl, propArrayCtrl, curLvl, propAddr);
+    debug.printf(nbrNumCtrl, "    nbrNum_In=%d\n", nbrNum_In);
+    debug.printf(propArrayCtrl, "    propArray = ");
+      printArrayHex(propArrayCtrl, propArray.elementsAsArray(), GC.PROPPERPKT); 
+      debug.printf(propArrayCtrl, "\n");
+    debug.printf(propArrayCtrl, "    propArrayOut = ");
+      printArrayHex(propArrayCtrl, propArrayOut.elementsAsArray(), GC.PROPPERPKT); 
+      debug.printf(propArrayCtrl, "\n");
+    debug.printf("    nbrNum=%d, ramRdPtr=%d, ramWrPtr=%d, nbrNumIdx=%d, nbrNumPkt=%d, begun=%d, knlDone=%d, clrDone=%d\n",
+                 nbrNum, ramRdPtr, ramWrPtr, nbrNumIdx, nbrNumPkt, begun,
+                 knlDone, clrDone);
+    debug.printf("    req_en=%d, req_brst_addr=%d, thisPkt=%d, updatePack=%o\n",
+                 req_en, req_brst_addr, thisPkt, updatePack);
+
+    flush.onTrigger(constant.var(false));
+  }
+
+}

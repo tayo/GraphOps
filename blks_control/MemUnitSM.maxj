@@ -1,0 +1,149 @@
+package pagerank.kernels;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelLib;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmInput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmOutput;
+import com.maxeler.maxcompiler.v2.statemachine.kernel.KernelStateMachine;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.buffer.DFEsmFifo;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.Buffer;
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateValue;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmValue;
+import com.maxeler.maxcompiler.v2.statemachine.types.DFEsmValueType;
+import pagerank.GC;
+
+public class MemUnitSM extends KernelStateMachine {
+
+  private final DFEsmInput  iReqEn;
+  private final DFEsmInput  iReqAddr;
+  private final DFEsmInput  iReqSize;
+  private final DFEsmOutput oReqEn;
+  private final DFEsmOutput oReqAddr;
+  private final DFEsmOutput oReqSize;
+
+  // State
+  DFEsmStateValue dbgCnt;
+  DFEsmStateValue addrReg;
+  DFEsmStateValue sizeReg;
+  DFEsmStateValue freePath;
+
+  DFEsmFifo addrFifo;
+  DFEsmFifo sizeFifo;
+
+  DFEsmValueType addrType = dfeUInt(GC.brstNbits);
+  DFEsmValueType sizeInType = dfeUInt(GC.sizeBits);
+  DFEsmValueType sizeOutType = dfeUInt(8);
+
+  public MemUnitSM(KernelLib owner, int qDepth) {
+    super(owner);
+
+    iReqEn   = io.input("reqCtrl", dfeBool());
+    iReqAddr = io.input("reqAddr", addrType);
+    iReqSize = io.input("reqSize", sizeInType);
+    oReqEn   = io.output("reqCtrlOut", dfeBool());
+    oReqAddr = io.output("reqAddrOut", addrType);
+    oReqSize = io.output("reqSizeOut", sizeOutType);
+
+    dbgCnt     = state.value(dfeUInt(32), 0);
+    addrReg = state.value(addrType, 0);
+    sizeReg = state.value(sizeInType, 0);
+    freePath = state.value(dfeBool(), true);
+
+    Buffer.DFEsmFifoConfig qCfg = new Buffer.DFEsmFifoConfig();
+    qCfg.setIsFirstWordFallThrough();
+    qCfg.setHasValidFlag();
+    qCfg.setHasDataCount();
+
+    addrFifo = buffer.fifo(addrType, qDepth, qCfg);
+    sizeFifo = buffer.fifo(sizeInType, qDepth, qCfg);
+  }
+
+  @Override
+  protected void nextState() {
+    dbgCnt.next    <== dbgCnt+1;
+
+    freePath.next <== freePath;
+    sizeReg.next <== sizeReg;
+    addrReg.next <== addrReg;
+
+    //Addr fifo
+    addrFifo.input.dataIn      <== iReqAddr;
+    addrFifo.input.writeEnable <== iReqEn;
+    DFEsmValue curAddr = addrFifo.output.dataOut;
+    //Size fifo
+    sizeFifo.input.dataIn      <== iReqSize;
+    sizeFifo.input.writeEnable <== iReqEn;
+    DFEsmValue curSize = sizeFifo.output.dataOut;
+
+    IF (addrFifo.input.full) {
+      debug.printf("  **Full-fifo MemUnitSM**\n");
+    }
+
+    // addrFifo and sizeFifo should empty simultaneously
+    DFEsmValue rdFifos = ~addrFifo.output.empty & freePath;
+    addrFifo.output.readEnable <== rdFifos;
+    sizeFifo.output.readEnable <== rdFifos;
+
+    IF (rdFifos & (curSize > 255)) { // new incoming big request
+      freePath.next <== constant.value(false);
+      sizeReg.next  <== curSize - 255;
+      addrReg.next  <== curAddr + 255;
+    }
+    IF (~freePath) { // working on previous big request
+      IF (sizeReg > 255) {
+        sizeReg.next  <== sizeReg - 255;
+        addrReg.next  <== addrReg + 255;
+        freePath.next <== constant.value(false);
+      } ELSE {
+        sizeReg.next  <== constant.value(sizeInType,0);
+        addrReg.next  <== constant.value(addrType, 0);
+        freePath.next <== constant.value(true);
+      }
+    }
+
+  }
+
+  @Override
+  protected void outputFunction() {
+    DFEsmValue rdFifos = ~addrFifo.output.empty & freePath;
+    DFEsmValue curAddr = addrFifo.output.dataOut;
+    DFEsmValue curSize = sizeFifo.output.dataOut;
+
+    oReqEn <== rdFifos | ~freePath;
+    IF (rdFifos) { 
+      oReqAddr <== curAddr;
+      IF (curSize > 255) { //initial request is less than 256
+        oReqSize <== constant.value(sizeOutType, 255);
+      } ELSE {
+        oReqSize <== curSize[7:0].cast(sizeOutType);
+      }
+    }
+    ELSE IF (~freePath) { //initial request was greater than 255
+      oReqAddr <== addrReg;
+      IF (sizeReg > 255) {
+        oReqSize <== constant.value(sizeOutType, 255);
+      } ELSE {
+        oReqSize <== sizeReg[7:0].cast(sizeOutType);
+      }
+    }
+    ELSE {
+      oReqAddr <== constant.value(addrType, 0);
+      oReqSize <== constant.value(sizeOutType, 0);
+    }
+
+    /*
+    // debug print
+    debug.printf("[MemUnitSM] cnt=%d : inputReq: en=%d, size=%d, addr=%d\n",
+      dbgCnt, iReqEn, iReqSize, iReqAddr);
+    debug.printf("    outputReq: en=%d, size=%d, addr=%d\n",
+      oReqEn, oReqSize, oReqAddr);
+    debug.printf("    addrFifo: val=%d, addr=%d, rdEn=%d, empty=%d, cnt=%d\n",
+      addrFifo.output.valid, curAddr, rdFifos, 
+      addrFifo.output.empty, addrFifo.data_count);
+    debug.printf("    sizeFifo: val=%d, size=%d, rdEn=%d, empty=%d, cnt=%d\n",
+      sizeFifo.output.valid, curSize, rdFifos, 
+      sizeFifo.output.empty, sizeFifo.data_count);
+    debug.printf("    freePath=%d, addrReg=%d, sizeReg=%d\n",
+      freePath, addrReg, sizeReg);
+    */
+  }
+}

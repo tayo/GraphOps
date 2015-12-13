@@ -1,0 +1,124 @@
+/* 
+ * A Manager State Machine that handles reading from LMem and adds
+ * a control bit to incoming data.  This helps resolve flow control issues
+ * because it provides an always-valid data stream to the kernels.
+ *
+ * This SM also avoids reading from memory if the client kernel is not ready for
+ * the data (stall).
+ */
+
+// --> This approach tracks the number of outstanding reads and only issues
+// control valid if there are outstanding reads to be had.  This failed because
+// the control data would arrive at the (inactive) kernels before the control
+// signals could be sent from the ReaderSM.  So the control data was getting
+// dropped and not processed.
+
+package graph_accel.kernels;
+
+import com.maxeler.maxcompiler.v2.managers.DFEManager;
+import com.maxeler.maxcompiler.v2.statemachine.manager.DFEsmPullInput;
+import com.maxeler.maxcompiler.v2.statemachine.manager.DFEsmPushOutput;
+import com.maxeler.maxcompiler.v2.statemachine.manager.ManagerStateMachine;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateValue;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmValue;
+import graph_accel.GC;
+
+// Debug
+import com.maxeler.maxcompiler.v2.statemachine.manager.DFEsmPushInput;
+
+public class ReaderSM_Q extends ManagerStateMachine {
+
+  private final DFEsmPullInput iMemData;
+  private final DFEsmPushOutput iData;
+  private final DFEsmPushOutput iDataCtrl;
+
+      // Debug
+      private final DFEsmPushInput  iSize;
+      private final DFEsmStateValue sizeLeft;
+
+  private final DFEsmStateValue iMemDataVal;
+  private final DFEsmStateValue dStallBuf;
+  private final DFEsmStateValue cStallBuf;
+  private final DFEsmStateValue dbgCnt;
+
+  private final int id;
+  public ReaderSM_Q(DFEManager owner, int id) {
+    super(owner);
+    this.id = id;
+    iMemData = io.pullInput("iMemData", dfeUInt(GC.PKTWIDTH));
+    iData = io.pushOutput("iData", dfeUInt(GC.PKTWIDTH), 1);
+    iDataCtrl = io.pushOutput("iDataCtrl", dfeBool(), 1);
+    iMemDataVal  = state.value(dfeBool(), false);
+    dStallBuf = state.value(dfeBool(), false);  // stall latency buffer
+    cStallBuf = state.value(dfeBool(), false);  // stall latency buffer
+    dbgCnt = state.value(dfeUInt(32), 0);
+      // Debug
+      iSize = io.pushInput("iSize", dfeUInt(GC.sizeBits), 1);
+      sizeLeft = state.value(dfeUInt(32), 0);
+  }
+
+  @Override
+  protected void nextState() {
+      // Debug
+      DFEsmValue numPkts = iSize * GC.PKTSPERBRST;
+      IF (iSize.valid) {
+        sizeLeft.next <== sizeLeft + numPkts.cast(dfeUInt(32)) - iMemDataVal.cast(dfeUInt(32));
+      } ELSE {
+        sizeLeft.next <== sizeLeft - iMemDataVal.cast(dfeUInt(32));
+      }
+    dbgCnt.next <== dbgCnt+1;
+
+    DFEsmValue sendD = ~dStallBuf | ~iData.stall;
+    DFEsmValue sendC = ~cStallBuf | ~iDataCtrl.stall;
+    DFEsmValue send = sendC & sendD;
+
+    IF (iData.stall & iMemDataVal) {
+      dStallBuf.next <== 1;
+    } ELSE {
+      IF (~iMemDataVal) dStallBuf.next <== iData.stall;
+      ELSE dStallBuf.next <== 0;
+    }
+
+    IF (iDataCtrl.stall & send) {
+      cStallBuf.next <== 1;
+    } ELSE {
+      IF (~send) cStallBuf.next <== iDataCtrl.stall;
+      ELSE cStallBuf.next <== 0;
+    }
+
+    //only request data if !stall -- cannot request data if !buf because stall
+    //may get asserted when data arrives
+    iMemDataVal.next <== ~iMemData.empty & ~iData.stall & ~iDataCtrl.stall;
+    //iMemDataVal.next <== ~iMemData.empty & ~dStallBuf;
+  }
+
+  @Override
+  protected void outputFunction() {
+    DFEsmValue sendD = ~dStallBuf | ~iData.stall;     //send data
+    DFEsmValue sendC = ~cStallBuf | ~iDataCtrl.stall; //send control
+          // Debug
+          DFEsmValue numPkts = iSize * GC.PKTSPERBRST;
+          //DFEsmValue send = sendC & sendD;
+          DFEsmValue send = sendC & sendD & (numPkts>0);
+
+    // Push Outputs
+    iData.valid <== iMemDataVal;      // only send big packets when data valid
+    iData       <== iMemData;
+    iDataCtrl.valid <== send;
+    iDataCtrl       <== iMemDataVal;  //~iMemData.empty;  
+
+    // Pull Inputs
+    //only request data if !stall -- cannot request data if !buf because stall
+    //may get asserted when data arrives
+    iMemData.read   <== ~iMemData.empty & ~iData.stall & ~iDataCtrl.stall;
+
+    debug.printf("rsm-%d: %d: empty=%d, d.stall=%d, dBuf=%d, ctrl.stall=%d, cBuf=%d\n",
+        id, dbgCnt, iMemData.empty, iData.stall, dStallBuf, iDataCtrl.stall, cStallBuf);
+    debug.printf("        d.rd=oDctrl.nxt=%d, oDctrl=%d, data[15]=%d\n",
+      ~iMemData.empty&~iData.stall&~iDataCtrl.stall, iMemDataVal, iMemData[767:720]);
+          // Debug
+          debug.printf("        numPkts_In=%d (val=%d), pktsLeft=%d\n",
+            iSize*GC.PKTSPERBRST, iSize.valid, sizeLeft);                 
+  }
+}
+

@@ -1,0 +1,334 @@
+package graph_accel.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.SMIO;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Mem.RamWriteMode;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.WrapMode;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.IO.*;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Stream.OffsetExpr;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.memory.Memory;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Bitops;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import graph_accel.GC;
+import graph_accel.blocks.*;
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+
+// Sends requests for prop elements (BFS levels)
+
+public class LvlReader extends Kernel {
+
+  // return value is select control of mux
+  private DFEVar prArb(int width, DFEVar req, DFEVar base) {
+    DFEVar doubleReq = (req # req).cast(dfeUInt(2*width));
+    DFEVar diff = doubleReq - base.cast(dfeUInt(2*width));
+    DFEVar doubleGrant = doubleReq & ~diff;
+    DFEVar grant = doubleGrant.slice(0, width) | doubleGrant.slice(width, width);
+    return grant; // return value can be RawBits, so no need to cast
+    //return grant.cast(dfeUInt(width));
+  }
+
+  private void printArray(DFEVar ctrl, DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf(ctrl, "%d ", ar[size-1-i]); 
+    }
+  }
+
+  public LvlReader(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(64);
+    // Scalar Inputs
+    DFEVar propAddr = io.scalarInput("propAddr", dfeUInt(GC.scalWidth));
+    DFEVar uDVal    = io.scalarInput("uDVal"   , dfeUInt(32));
+
+    // Inputs from BVCReader
+      //DFEVar clrDone = io.input("clrDone", dfeBool());
+    NonBlockingInput<DFEVar> clrDone_In =
+      io.nonBlockingInput("clrDone", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar clrDone = clrDone_In.valid ? clrDone_In.data : constant.var(false);
+
+
+    // Inputs from DRAM:  edge lists
+    DFEArrayType<DFEVar> arrayType = 
+      new DFEArrayType<DFEVar>(dfeUInt(GC.EDGEWIDTH), GC.NBRSPERPKT);
+      //DFEArray<DFEVar> edgeArray = io.input("edgeArray", arrayType);
+      //DFEVar edgeArrayCtrl = io.input("edgeArrayCtrl", dfeBool());
+      //DFEArray<DFEVar> edgeArray = io.input("edgeArray", arrayType, edgeArrayCtrl);
+    NonBlockingInput<DFEArray<DFEVar>> edgeArray_In = 
+      io.nonBlockingInput("edgeArray", arrayType, constant.var(true), 1,
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEArray<DFEVar> edgeArray = edgeArray_In.data;
+    DFEVar edgeArrayCtrl       = edgeArray_In.valid;
+
+    // Inputs from EdgeReader
+    DFEType ePtrType = dfeUInt(GC.ePtrWidth);
+    int numPktsBits = 16;
+    int ePtrDataWidth = numPktsBits + GC.ePtrWidth + GC.ePtrWidth;
+    NonBlockingInput<DFEVar> edgePtrData_In =
+      io.nonBlockingInput("edgePtrData", dfeRawBits(ePtrDataWidth), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar edgePtrData    = edgePtrData_In.data;
+    DFEVar edgePtrCtrl    = edgePtrData_In.valid;
+    DFEVar edgePtr0_In    = edgePtrData.slice(0, GC.ePtrWidth).cast(dfeUInt(GC.ePtrWidth));
+    DFEVar edgePtr1_In    = edgePtrData.slice(GC.ePtrWidth, GC.ePtrWidth).cast(dfeUInt(GC.ePtrWidth));;
+    DFEVar edgeNumPktsRaw = edgePtrData.slice(2*GC.ePtrWidth, numPktsBits);
+    DFEVar edgeNumPkts    = edgeNumPktsRaw.cast(dfeUInt(numPktsBits));
+
+
+    // Queue Reader SM
+    // for each elemIdx, tracks how many packets need to be consumed before
+    // incrementing the RAM read pointer
+    SMIO ctrlSM = addStateMachine("LvlReaderCtrl", 
+                                  new QRdrPktCntSM(this, numPktsBits, GC.edgeIdxRamDepth));
+    ctrlSM.connectInput("pktVal",     edgeArrayCtrl);
+    ctrlSM.connectInput("numPkts",    edgeNumPkts);
+    ctrlSM.connectInput("numPktsVal", edgePtrCtrl);
+    DFEVar incRamRdPtr = ctrlSM.getOutput("incRdPtr");
+    DFEVar pktCnt      = ctrlSM.getOutput("pktCnt");
+
+    // FIFOs
+    Count.Params ramRdPtrParams = control.count.makeParams(GC.ePtrRamDepthBits) //RdPtr
+        .withEnable(incRamRdPtr); 
+    Count.Params ramWrPtrParams = control.count.makeParams(GC.ePtrRamDepthBits) //WrPtr
+        .withEnable(edgePtrCtrl); 
+    DFEVar ramRdPtr = (control.count.makeCounter(ramRdPtrParams)).getCount();
+    DFEVar ramWrPtr = (control.count.makeCounter(ramWrPtrParams)).getCount();
+    //edgePtr0 FIFO
+    Memory <DFEVar> edgePtr0Ram = mem.alloc( ePtrType, GC.ePtrRamDepth);
+    edgePtr0Ram.write(ramWrPtr, edgePtr0_In , edgePtrCtrl);
+    DFEVar edgePtr0 = edgePtr0Ram.read(ramRdPtr);
+    //edgePtr1 FIFO
+    Memory <DFEVar> edgePtr1Ram = mem.alloc( ePtrType, GC.ePtrRamDepth);
+    edgePtr1Ram.write(ramWrPtr, edgePtr1_In , edgePtrCtrl);
+    DFEVar edgePtr1 = edgePtr1Ram.read(ramRdPtr);  // edgePtr-1 (subtract prev kernel)
+
+    int numBits = GC.nPBBits+GC.brstNbits > GC.ePtrWidth ? 
+                GC.ePtrWidth-GC.nPBBits : GC.brstNbits;
+    DFEVar edgeBrst0 = edgePtr0.slice(GC.nPBBits, numBits).cast(dfeUInt(numBits));
+    DFEVar edgeBrst1 = edgePtr1.slice(GC.nPBBits, numBits).cast(dfeUInt(numBits));
+
+    
+    // Generate a mask of which incoming data elements are active
+    int arSize = GC.NBRSPERPKT;
+    DFEVar[] pktMask = new DFEVar[arSize];
+
+    /*
+    DFEType pktCntType = dfeUInt(numPktsBits);
+    DFEVar edgePkt0 = edgePtr0.slice(GC.ePPBits, GC.pktsPBBits).cast(pktCntType);
+    DFEVar edgePkt1base = (edgeBrst1 - edgeBrst0) << GC.pktsPBBits;
+    DFEVar edgePkt1off = edgePtr1.slice(GC.ePPBits, GC.pktsPBBits);
+    DFEVar edgePkt1 = edgePkt1off.cast(pktCntType) + edgePkt1base.cast(pktCntType);
+    */
+    DFEType pktCntType = dfeUInt(numPktsBits);
+    int buf1 = numPktsBits - GC.pktsPBBits;
+    DFEVar edgePkt0Raw = constant.var(dfeUInt(buf1), 0) #  //cannot cast small to big
+                           edgePtr0.slice(GC.ePPBits, GC.pktsPBBits);
+    DFEVar edgePkt0 = edgePkt0Raw.cast(pktCntType);
+    DFEVar edgePkt1off = constant.var(dfeUInt(buf1), 0) # 
+                           edgePtr1.slice(GC.ePPBits, GC.pktsPBBits);
+    DFEVar edgePkt1base = (edgeBrst1 - edgeBrst0) << GC.pktsPBBits;
+    DFEVar edgePkt1 = edgePkt1off.cast(pktCntType) + edgePkt1base.cast(pktCntType);
+
+    DFEVar midPkt = edgeArrayCtrl & (pktCnt > edgePkt0) & (pktCnt < edgePkt1);
+    DFEVar onePkt = edgeArrayCtrl & edgePkt0.eq(edgePkt1);
+    DFEVar firstPkt = edgeArrayCtrl & pktCnt.eq(edgePkt0) & ~onePkt; 
+    DFEVar lastPkt  = edgeArrayCtrl & pktCnt.eq(edgePkt1) & ~onePkt;
+    DFEVar onlyPkt = edgeArrayCtrl & onePkt & pktCnt.eq(edgePkt0);
+    DFEVar elem0 = (edgePtr0.slice(0, GC.ePPBits)).cast(dfeUInt(GC.ePPBits));;
+    DFEVar elem1 = (edgePtr1.slice(0, GC.ePPBits)).cast(dfeUInt(GC.ePPBits));;
+    DFEVar[] firstPktVal = new DFEVar[arSize];
+    DFEVar[] lastPktVal = new DFEVar[arSize];
+    DFEVar[] onlyPktVal = new DFEVar[arSize];
+
+    SMIO [] lvlReqFifo = new SMIO[arSize];
+    DFEType edgeType = dfeUInt(GC.EDGEWIDTH);
+    OffsetExpr reqRdEnLoopLen = stream.makeOffsetAutoLoop("reqRdEnLoopLen");
+    DFEVar lvlReqRdEn = dfeRawBits(arSize).newInstance(this);
+    DFEVar[] lvlReqOutputs = new DFEVar[arSize];
+    DFEArrayType<DFEVar> boolArray =
+      new DFEArrayType<DFEVar>(dfeBool(), arSize);
+    DFEArray<DFEVar> lvlReqAvail  = boolArray.newInstance(this);
+    DFEVar edgeToRead = edgeType.newInstance(this);
+    //XX-DFEVar edgeToRead = ePtrType.newInstance(this);
+
+    for (int i = 0; i < arSize; i++) {
+      // Generate masks
+      firstPktVal[i] = (firstPkt & (i >= elem0)); 
+      lastPktVal[i] = (lastPkt & (i <= elem1)); 
+      onlyPktVal[i] = (onlyPkt & (i >= elem0) & (i <= elem1));
+      pktMask[i] = midPkt | firstPktVal[i] | lastPktVal[i] | onlyPktVal[i];
+
+      // FIFOs to store outgoing requests
+      lvlReqFifo[i] = addStateMachine("LvlReqFifo"+i,
+                                      new FifoKernelSM(this, GC.EDGEWIDTH, //XX-GC.ePtrWidth,
+                                                       GC.lvlReqRamDepth));
+
+      lvlReqFifo[i].connectInput("dataIn", edgeArray[i]);
+      //XX-lvlReqFifo[i].connectInput("dataIn", edgeArray[i].slice(0, GC.ePtrWidth).cast(dfeUInt(GC.ePtrWidth)));
+      lvlReqFifo[i].connectInput("dataVal", pktMask[i]);
+      lvlReqFifo[i].connectInput("readEn", lvlReqRdEn.slice(i).cast(dfeBool()));
+      lvlReqOutputs[i] = lvlReqFifo[i].getOutput("dataOut");
+      lvlReqAvail[i] <== lvlReqFifo[i].getOutput("dataRdy");
+    }
+    
+    DFEVar tmpBaseCnt = control.count.simpleCounter(GC.ePPBits);
+    DFEVar arbBaseCnt = constant.var(dfeUInt(arSize), 1) << tmpBaseCnt;
+    DFEVar arbReq = lvlReqAvail.pack();
+    // handle control fwd loop 
+    lvlReqRdEn <== prArb(arSize, stream.offset(arbReq, -reqRdEnLoopLen), arbBaseCnt);
+    edgeToRead <== control.oneHotMux(lvlReqRdEn, lvlReqOutputs);
+    DFEVar edgeToReadVal = (arbReq & lvlReqRdEn).cast(dfeUInt(arSize)) > 0;
+    //DFEVar emitReq     = (arbReq & lvlReqRdEn).cast(dfeUInt(arSize)) > 0;
+    
+
+    ///////////////////////////
+    //
+    // Visited Bitmap
+    //   - uses a simultaneous read/write operation (read occurs before write)
+    //   - if the read result is negative, then this neighbor is on the frontier
+    //     and is sent on to be written in the LvlUpdater
+    //
+    ///////////////////////////
+    int bmDepth = GC.bitmapDepth;
+    int bmDepthBits = MathUtils.bitsToAddress(bmDepth);
+    Memory <DFEVar> visitedBM = mem.alloc(dfeBool(), bmDepth);
+    // Attemt to initialize RAM
+    //double initContents[] = new double[bmDepth];
+    //for (int i = 0; i < bmDepth; i++) initContents[i] = 0;
+    //visitedBM.setContents(initContents);
+    // Issue:  Cannot use ROM initialization (setContents() method) in tandem with
+    // read/write call (Mem.port)
+      // a) Remove read/write port. Switch to just read. -- works
+      // b) Change initialization to something that can work with r/w port.
+
+    // Initialization of RAM
+    Count.Params bmInitCntParams = control.count.makeParams(bmDepthBits)
+      .withMax(bmDepth)
+      .withEnable(constant.var(true))
+      .withWrapMode(WrapMode.STOP_AT_MAX);
+    DFEVar bmInitCnt = (control.count.makeCounter(bmInitCntParams)).getCount();
+    DFEVar bmInitDone = bmInitCnt.eq(bmDepth);
+    //initialize RAM with all zeros
+    visitedBM.write(bmInitCnt, constant.var(false), ~bmInitDone);
+
+    DFEVar bmAddr = edgeToRead.cast(dfeUInt(bmDepthBits));
+    DFEVar visited = visitedBM.port(bmAddr,             // location in bitmap
+                                    constant.var(true), // write a '1' into this bit
+                                    edgeToReadVal,      // enable signal
+                                    RamWriteMode.READ_FIRST);
+    //DFEVar visited = visitedBM.read(bmAddr);
+
+    DFEVar emit = edgeToReadVal & ~visited;
+    //DFEVar emit = edgeToReadVal;  // remove bitmap
+
+
+
+    // Determine when the kernel has finished processing for this curLvl
+    DFEVar edgePtrCtrl_d = stream.offset(edgePtrCtrl, -1); //avoid blip with first elem
+    DFEVar begun = Reductions.streamHold(edgePtrCtrl_d, edgePtrCtrl_d|clrDone,
+                                         dfeBool().encodeConstant(false));
+    DFEVar emptyRam = ramRdPtr.eq(ramWrPtr);
+    DFEVar emptyReqs = arbReq.eq(0);
+    DFEVar knlDone = begun & emptyRam & emptyReqs;
+    DFEVar knlDonePrev = stream.offset(knlDone, -1);
+
+    //DFEVar sendDone = knlDone & ~knlDonePrev;
+    DFEVar doneVal  = knlDone &  knlDonePrev;
+    Count.Params sendDoneParams = control.count.makeParams(32)
+      .withEnable(doneVal)
+      .withReset(clrDone);
+    DFEVar sendDoneCnt = (control.count.makeCounter(sendDoneParams)).getCount();
+    DFEVar sendLength = uDVal*2;
+    DFEVar sendDone = knlDone & (sendDoneCnt < sendLength);
+    
+    // Outputs to MemUnit
+    DFEType reqAddrType = dfeUInt(GC.brstNbits);
+    DFEType reqSizeType = dfeUInt(GC.sizeBits);
+    DFEVar propAddrBase = propAddr.cast(reqAddrType);
+    DFEVar brstToReq = edgeToRead.slice(GC.pPBBits, GC.brstNbits).cast(dfeUInt(GC.brstNbits));
+    DFEVar req_size = constant.var(dfeUInt(GC.sizeBits), 1);
+    DFEVar req_en   = emit; //emitReq;
+    DFEVar req_brst_addr = brstToReq+propAddrBase;
+    //io.output("memReq", req_size#req_brst_addr#req_en, dfeRawBits(GC.memReqWidth));
+      //io.output("req_brst_addr", req_brst_addr,    reqAddrType);
+      //io.output("req_size"     , req_size,         reqSizeType);
+      //io.output("req_en"       , req_en,           dfeBool());
+
+    // Outputs to LvlUpdater:  nbr number
+      //io.output("nbrNumCtrl", req_en, dfeBool());
+    //XX-io.output("nbrNum"    , edgeToRead, ePtrType, req_en);
+    io.output("nbrNum"    , edgeToRead, edgeType, req_en);
+    // Outputs to BVN_Writer
+    io.output("lvlRdrIdle", knlDone, dfeBool(), sendDone|clrDone); //, constant.var(true)); 
+
+    ////////////////////////////////////////////////////////////////////////////
+    // Debug -- Scalar Outputs
+    DFEVar sawIncRdPtr = Reductions.streamHold(incRamRdPtr, incRamRdPtr,
+                                              dfeBool().encodeConstant(false));
+    DFEVar sawBegun = Reductions.streamHold(begun, begun,
+                                           dfeBool().encodeConstant(false));
+    DFEVar sawArray = Reductions.streamHold(edgeArrayCtrl, edgeArrayCtrl,
+                                           dfeBool().encodeConstant(false));
+    DFEVar sawEdgeCtrlD = Reductions.streamHold(edgePtrCtrl_d, edgePtrCtrl_d,
+                                           dfeBool().encodeConstant(false));
+      //edgePtr counter
+      Count.Params eCParams = control.count.makeParams(32)
+        .withReset(clrDone)
+        .withEnable(edgePtrCtrl);
+      Counter eCounter = control.count.makeCounter(eCParams);
+      DFEVar eCnt = eCounter.getCount();
+      //nbrNum counter
+      Count.Params nNCParams = control.count.makeParams(32)
+        .withReset(clrDone)
+        .withEnable(req_en);
+      Counter nNCounter = control.count.makeCounter(nNCParams);
+      DFEVar nbrNumCnt = nNCounter.getCount();
+      
+    io.scalarOutput("scalarOut_0", eCnt, dfeUInt(32));
+    io.scalarOutput("scalarOut_1", nbrNumCnt, dfeUInt(32));
+    //io.scalarOutput("scalarOut_", sawBegun, dfeBool());
+    //io.scalarOutput("scalarOut_", sawArray, dfeBool());
+    //io.scalarOutput("scalarOut_", sawEdgeCtrlD, dfeBool());
+    ////////////////////////////////////////////////////////////////////////////
+
+    // debug
+    debug.printf("LvlReader: cnt=%d, pktCnt=%d\n", cnt, pktCnt);
+    debug.printf(edgePtrCtrl, "    ePtrCtrl=%d, ePtr0_In=%d, ePtr1_In=%d\n",  
+      edgePtrCtrl, edgePtr0_In, edgePtr1_In);
+    debug.printf("    ePtr0=%d, ePtr1=%d, ramRdPtr=%d, incRd=%d, ramWrPtr=%d\n",
+      edgePtr0, edgePtr1, ramRdPtr, incRamRdPtr, ramWrPtr);
+    debug.printf(constant.var(true)/*edgeArrayCtrl*/, "    edgeArrayCtrl=%d, edgeArray = ", edgeArrayCtrl);
+      printArray(constant.var(true)/*edgeArrayCtrl*/, edgeArray.elementsAsArray(), arSize); 
+      debug.printf(constant.var(true)/*edgeArrayCtrl*/, "\n");
+    debug.printf("    [Fifo] numPkts_In=%d, numPktsVal=%d, incRd=%d, pktCnt=%d\n", 
+      edgeNumPkts, edgePtrCtrl, incRamRdPtr, pktCnt);
+    debug.printf("    edgePkt0=%d, edgePkt1=%d, pktMask=",
+      edgePkt0, edgePkt1);
+    printArray(constant.var(true), pktMask, arSize);  debug.printf("\n");
+    debug.printf("    lvlReqAvail=  "); 
+      printArray(constant.var(true), lvlReqAvail.elementsAsArray(), arSize); debug.printf("\n");
+    //debug.printf("    lvlReqOutputs=  "); 
+    //  printArray(lvlReqOutputs, arSize); debug.printf("\n");
+    debug.printf("    lvlReqRdEn (arb output)=%o\n", lvlReqRdEn);
+    debug.printf("    done: begun=%d, emptyRam=%d, emptyReqs=%d\n",
+      begun, emptyRam, emptyReqs);
+    debug.printf("    knlDone=%d, clrDone=%d, doneVal=%d, sendDoneCnt=%d, sendDone=%d\n",
+        knlDone, clrDone, doneVal, sendDoneCnt, sendDone);
+    debug.printf("    edgeToRead=%d, req_en=%d, req_brst_addr=%d\n", 
+      edgeToRead, req_en, brstToReq);
+    debug.printf("    Bitmap: bmAddr=%d, edgeToRdVal=%d, visited=%d, emit=%d\n",
+      bmAddr, edgeToReadVal, visited, emit);
+    debug.printf("    Bitmap: initCnt=%d, initDone=%d\n",
+      bmInitCnt, bmInitDone);
+
+    flush.onTrigger(constant.var(false));
+  }
+}

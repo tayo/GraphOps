@@ -1,0 +1,201 @@
+package bfs_rep_u.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.SMIO;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.IO.*;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.memory.Memory;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+//import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Stream.OffsetExpr;
+import bfs_rep_u.GC;
+
+public class EdgeReader extends Kernel {
+
+  private void printArray(DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf("%d ", ar[size-1-i]); 
+    }
+  }
+
+  public EdgeReader(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(64);
+    // Scalar Inputs
+    DFEVar edgeAddr = io.scalarInput("edgeAddr", dfeUInt(GC.scalWidth));
+    DFEVar uDVal    = io.scalarInput("uDVal"   , dfeUInt(32));
+
+    // Inputs from DRAM:  node lists
+    int arSize = GC.NODESPERPKT;
+    DFEArrayType<DFEVar> arrayType = 
+      new DFEArrayType<DFEVar>(dfeUInt(GC.NODEWIDTH), arSize);
+    //DFEArray<DFEVar> nodeArray = io.input("nodeArray", arrayType);
+    //DFEVar nodeArrayCtrl = io.input("nodeArrayCtrl", dfeBool());
+    //DFEArray<DFEVar> nodeArray = io.input("nodeArray", arrayType, nodeArrayCtrl);
+
+    NonBlockingInput<DFEArray<DFEVar>> nodeArray_In = 
+      io.nonBlockingInput("nodeArray", arrayType, constant.var(true), 1,
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    //NonBlockingInput<DFEArray<DFEVar>> nodeArray = io.nonBlockingInput("nodeArray", arrayType, 
+    //                  constant.var(true), 1, NonBlockingMode.NO_TRICKLING);
+    DFEArray<DFEVar> nodeArray = nodeArray_In.data;
+    DFEVar nodeArrayCtrl       = nodeArray_In.valid;
+
+    // Inputs from NodeReader:  node being accessed
+    NonBlockingInput<DFEVar> elem_Input =
+      io.nonBlockingInput("elem", dfeUInt(GC.nodeWidth), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar elem_In  = elem_Input.data;
+    DFEVar elemCtrl = elem_Input.valid;
+    DFEVar elemIdx_In = elem_In.slice(0, GC.nPBBits).cast(dfeUInt(GC.nPBBits));
+
+    // Inputs from BVCReader
+    //DFEVar clrDone = io.input("clrDone", dfeBool());
+    NonBlockingInput<DFEVar> clrDone_In =
+      io.nonBlockingInput("clrDone", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar clrDone = clrDone_In.valid ? clrDone_In.data : constant.var(false);
+
+
+    // Queue Reader SM
+    // - for each elemIdx, tracks how many packets need to be consumed before
+    //   incrementing the RAM read pointer
+    // - flexible approach is needed to account for overflow (receive 2 bursts)
+    int buf = 2;
+    int pktCntBits = GC.pktsPBBits+buf;  // Allow space for multiple bursts
+    DFEType pktCntType = dfeUInt(pktCntBits);
+      int lastNodeInBrstIdx = GC.NODESPERBRST-1;
+      DFEVar ovflow_In = elemIdx_In.eq(lastNodeInBrstIdx);
+      DFEVar iNumPkts  = ~ovflow_In ? constant.var(pktCntType, GC.PKTSPERBRST)
+                                   : constant.var(pktCntType, 2*GC.PKTSPERBRST);
+    SMIO ctrlSM = addStateMachine("EdgeReaderCtrl", 
+                          new QRdrPktCntSM(this, pktCntBits, GC.elemIdxRamDepth));
+    ctrlSM.connectInput("pktVal",     nodeArrayCtrl);
+    ctrlSM.connectInput("numPkts",    iNumPkts);
+    ctrlSM.connectInput("numPktsVal", elemCtrl);
+    DFEVar incRamRdPtr = ctrlSM.getOutput("incRdPtr");
+    DFEVar pktCnt      = ctrlSM.getOutput("pktCnt");
+
+    
+    // Elem Num FIFO
+    //   Stores queue of elems to use when processing incoming edge lists
+    //   Pop the queue when all associated packets have been processed
+    Count.Params ramRdPtrParams = control.count.makeParams(GC.eIdxRamDepthBits) //RdPtr
+        .withEnable(incRamRdPtr);
+    Count.Params ramWrPtrParams = control.count.makeParams(GC.eIdxRamDepthBits) //WrPtr
+        .withEnable(elemCtrl);
+    Counter ramRdPtrCounter = control.count.makeCounter(ramRdPtrParams);
+    Counter ramWrPtrCounter = control.count.makeCounter(ramWrPtrParams);
+    DFEVar ramRdPtr = ramRdPtrCounter.getCount();
+    DFEVar ramWrPtr = ramWrPtrCounter.getCount();
+    Memory <DFEVar> elemRam = mem.alloc( dfeUInt(GC.nodeWidth), GC.elemIdxRamDepth);
+    elemRam.write(ramWrPtr, elem_In, elemCtrl);
+    DFEVar elem    = elemRam.read(ramRdPtr);
+    DFEVar elemIdx = elem.slice(0, GC.nPBBits).cast(dfeUInt(GC.nPBBits));
+
+
+    // Determine when the kernel has finished processing for this curLvl
+    DFEVar elemIdxCtrl_d = stream.offset(elemCtrl, -1); //avoid blip with first ctrl
+    DFEVar begun = Reductions.streamHold(elemIdxCtrl_d, 
+                                         elemIdxCtrl_d | clrDone,
+                                         dfeBool().encodeConstant(false));
+    DFEVar emptyRam = ramRdPtr.eq(ramWrPtr);
+    DFEVar knlDone = begun & emptyRam;
+    DFEVar knlDonePrev = stream.offset(knlDone, -1);
+
+    //DFEVar sendDone = knlDone & ~knlDonePrev;
+    DFEVar doneVal  = knlDone &  knlDonePrev;
+    Count.Params sendDoneParams = control.count.makeParams(32)
+      .withEnable(doneVal)
+      .withReset(clrDone);
+    DFEVar sendDoneCnt = (control.count.makeCounter(sendDoneParams)).getCount();
+    DFEVar sendLength = uDVal*2;
+    DFEVar sendDone = knlDone & (sendDoneCnt < sendLength);
+
+    
+    DFEVar elemIdxP1  = elemIdx+1;
+    DFEVar ovflow     = elemIdxP1.eq(0);
+    DFEVar pktRawBits = constant.var(dfeUInt(buf), 0) # 
+                        elemIdxP1.slice(GC.nPPBits, GC.pktsPBBits);
+    DFEVar elemPkt = ~ovflow ? pktRawBits.cast(pktCntType)
+                             : constant.var(pktCntType, GC.PKTSPERBRST);
+    DFEVar thisPkt = elemPkt.eq(pktCnt); //request emitted during this pkt's cycle
+
+    //DFEVar elemP1_pkt = (elemIdxP1.slice(GC.nPPBits, GC.pktsPBBits)).cast(dfeUInt(GC.pktsPBBits));
+    DFEVar elem_mux_sel   = elemIdx.slice(0, GC.nPPBits);
+    DFEVar elemP1_mux_sel = elemIdxP1.slice(0, GC.nPPBits);
+    
+    DFEVar newPkt  = elemP1_mux_sel.eq(0);
+    DFEVar ptr0Array  = control.mux(elem_mux_sel, nodeArray.elementsAsArray());
+    DFEVar edgePtr0   = ~newPkt ? ptr0Array : stream.offset(ptr0Array, -1);
+    DFEVar edgePtr1P1 = control.mux(elemP1_mux_sel, nodeArray.elementsAsArray());
+    DFEVar edgePtr1   = edgePtr1P1 - 1;
+    
+    // Outputs to MemUnit
+    DFEType reqAddrType = dfeUInt(GC.brstNbits);
+    DFEType reqSizeType = dfeUInt(GC.sizeBits);
+    DFEVar edgeBrst0 = edgePtr0.slice(GC.nPBBits, GC.brstNbits).cast(reqAddrType);
+    DFEVar edgeBrst1 = edgePtr1.slice(GC.nPBBits, GC.brstNbits).cast(reqAddrType);
+    DFEVar edgeAddrBase = edgeAddr.cast(reqAddrType);
+    DFEVar edgeBrsts = edgeBrst1 - edgeBrst0 + 1;
+    DFEVar req_size  = edgeBrsts.cast(reqSizeType);
+    DFEVar req_en    = thisPkt & nodeArrayCtrl;
+    DFEVar req_brst_addr = edgeBrst0+edgeAddrBase;
+    io.output("memReq", req_size#req_brst_addr#req_en, dfeRawBits(GC.memReqWidth));
+
+
+    DFEVar edgePkts   = (edgeBrst1-edgeBrst0+1)<<GC.pktsPBBits;
+    DFEVar edgePkts_  = edgePkts.slice(0, GC.numPktsBits);
+    DFEVar edgePtr0_ = edgePtr0.slice(0, GC.ePtrWidth);
+    DFEVar edgePtr1_ = edgePtr1.slice(0, GC.ePtrWidth);
+    int ePtrDataWidth = GC.nodeWidth + GC.numPktsBits + GC.ePtrWidth + GC.ePtrWidth;
+    io.output("edgePtrData", elem#edgePkts_#edgePtr1_#edgePtr0_, 
+              dfeRawBits(ePtrDataWidth), req_en);
+    // Outputs to BVN_Writer
+    io.output("edgeRdrIdle", knlDone, dfeBool(), sendDone|clrDone); //&&, constant.var(true));
+
+    /*
+    /////////////////////////////////////////
+    // Debug -- Scalar Outputs
+    DFEVar sawIncRdPtr = Reductions.streamHold(incRamRdPtr, incRamRdPtr,
+                                              dfeBool().encodeConstant(false));
+    DFEVar sawBegun = Reductions.streamHold(begun, begun,
+                                           dfeBool().encodeConstant(false));
+    DFEVar sawArray = Reductions.streamHold(nodeArrayCtrl, nodeArrayCtrl,
+                                           dfeBool().encodeConstant(false));
+      //elemIdx counter
+      Count.Params eCParams = control.count.makeParams(32)
+        .withReset(clrDone)
+        .withEnable(elemCtrl);
+      Counter eCounter = control.count.makeCounter(eCParams);
+      DFEVar eCnt = eCounter.getCount();
+
+    io.scalarOutput("scalarOut_0", eCnt, dfeUInt(32));
+    //io.scalarOutput("scalarOut_", sawBegun, dfeBool());
+    //io.scalarOutput("scalarOut_", sawArray, dfeBool());
+    */
+
+
+    // debug
+    debug.printf("EdgeReader: cnt=%d, pktCnt=%d, edgeAddr=%d\n", cnt, pktCnt, edgeAddr);
+    debug.printf("    elemCtrl=%d, elem_In=%d, elemIdx_In=%d, eIdx=%d, wrPtr=%d, rdPtr=%d\n",
+        elemCtrl, elem_In, elemIdx_In, elemIdx, ramWrPtr, ramRdPtr);
+    debug.printf("    inArCtrl=%d, numPkts=%d, edgePtr0=%d, edgePtr1=%d, req_en=%d\n",
+				nodeArrayCtrl, edgePkts, edgePtr0, edgePtr1, req_en);
+    debug.printf("    nodeArray = "); printArray(nodeArray.elementsAsArray(), arSize);
+    debug.printf("\n");
+    debug.printf("    [pkts] incRd=%d, ovflow=%d, hotPkt=%d, req_addr=%d, req_size=%d\n", 
+       incRamRdPtr, ovflow, elemPkt, req_brst_addr, req_size);
+    debug.printf("    thisPkt=%d, edgeBrst0=%d, edgeBrst1=%d, begun=%d, emptyRam=%d\n", 
+        thisPkt, edgeBrst0, edgeBrst1, begun, emptyRam);
+    debug.printf("    knlDone=%d, clrDone=%d, doneVal=%d, sendDoneCnt=%d, sendDone=%d\n",
+        knlDone, clrDone, doneVal, sendDoneCnt, sendDone);
+    
+    flush.onTrigger(constant.var(false));
+  }
+}

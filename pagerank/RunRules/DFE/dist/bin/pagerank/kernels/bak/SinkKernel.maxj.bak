@@ -1,0 +1,62 @@
+package graph_accel.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+
+import graph_accel.GC;
+
+public class SinkKernel extends Kernel {
+
+  private void printArray(DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf("%d ", ar[size-1-i]); 
+    }
+  }
+  
+  public SinkKernel (KernelParameters parameters) {
+
+    super(parameters);
+
+    DFEVar cnt = control.count.simpleCounter(32);
+
+    // Input pkt (several pkts equals one burst)
+    //DFEArrayType<DFEVar> arrayType = 
+    //  new DFEArrayType<DFEVar>(dfeUInt(GC.NODEWIDTH), GC.NODESPERPKT);
+    //DFEArray<DFEVar> inArray = io.input("inData", arrayType);
+    //DFEVar inArrayCtrl = io.input("inDataCtrl", dfeBool());
+
+    // Inputs from DRAM:  lvl numbers
+    DFEArrayType<DFEVar> arrayType = 
+      new DFEArrayType<DFEVar>(dfeUInt(GC.PROPWIDTH), GC.PROPPERPKT);
+    DFEArray<DFEVar> propArray = io.input("propArray", arrayType);
+    DFEVar propArrayCtrl = io.input("propArrayCtrl", dfeBool());
+
+    // Inputs from LvlReader
+    DFEVar nbrNum = io.input("nbrNum", dfeUInt(GC.EDGEWIDTH));
+    DFEVar nbrNumCtrl = io.input("nbrNumCtrl", dfeBool());
+
+    //DFEVar brst_addr = io.input("req_brst_addr", dfeUInt(GC.brstNbits));
+    //DFEVar req_size  = io.input("req_size", dfeUInt(GC.sizeBits));
+    //DFEVar req_en    = io.input("req_en", dfeBool());
+
+    //DFEVar cmd = io.input("cmd_in", dfeUInt(64));
+
+    // Do stuff with the data...
+
+    // debug
+    debug.printf(/*propArrayCtrl,*/ "SinkKernel: cnt=%d, propArrayCtrl=%d\n", 
+                 cnt, propArrayCtrl);
+    debug.printf(/*propArrayCtrl,*/ "    propArray = ");
+      printArray(propArray.elementsAsArray(), GC.PROPPERPKT); debug.printf("\n");
+    debug.printf(/*nbrNumCtrl,*/ "    nbrNumCtrl=%d, nbrNum=%d\n",
+                 nbrNumCtrl, nbrNum);
+    //debug.printf("SinkKernel : cnt=%d, inArrayCtrl=%d, inArray0=%x, inArray1=%x\n", 
+    //    cnt, inArrayCtrl, inArray[0], inArray[1]);
+    //debug.printf("SinkKernel: cnt=%d, addr=%d, req_size=%d, req_en=%d\n", 
+    //  cnt, brst_addr, req_size, req_en);
+    //debug.printf("SinkKernel : cmd_in=%d\n", cmd);
+  }
+}

@@ -1,0 +1,88 @@
+package pagerank;
+
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+
+/*
+ * Graph Config (GC)
+ */
+
+public class GC {
+
+  // 
+  public static int N = 2048;
+
+  // I/O Constants
+  public static int ioCount = 1;  // number of read and write i/o streams
+  public static int STREAM0 = 0;
+  public static int STREAM1 = 1;
+
+  // Graph Constants
+  public static int BURSTWIDTH = 1536; //3072; //set by setBurstSize() in mgr
+  public static int PKTWIDTH =  768; // N pkts form a burst
+  public static int PKTSPERBRST = (BURSTWIDTH/PKTWIDTH);
+  public static int NODEWIDTH =   48; //48 (instead of 32 or 64) allows for 64 elems per burst (power of 2)
+  public static int EDGEWIDTH =   48;
+  public static int PROPWIDTH =   48; // 48-bit float  //24;
+  public static int NODESPERBRST = BURSTWIDTH/NODEWIDTH;
+  public static int NODESPERPKT = PKTWIDTH/NODEWIDTH;
+  public static int NBRSPERBRST = (BURSTWIDTH/EDGEWIDTH);
+  public static int NBRSPERPKT = (PKTWIDTH/EDGEWIDTH);
+  public static int PROPPERBRST = (BURSTWIDTH/PROPWIDTH);
+  public static int PROPPERPKT = (PKTWIDTH/PROPWIDTH);
+  public static int nPBBits = MathUtils.bitsToAddress(NODESPERBRST);//nodesPerBurst
+  public static int nPPBits = MathUtils.bitsToAddress(NODESPERPKT); //nodesPerPkt
+  public static int ePBBits = MathUtils.bitsToAddress(NBRSPERBRST); //nbrsPerBurst
+  public static int ePPBits = MathUtils.bitsToAddress(NBRSPERPKT); //nbrsPerPkt
+  public static int pPBBits = MathUtils.bitsToAddress(PROPPERBRST); //propPerBurst
+  public static int pPPBits = MathUtils.bitsToAddress(PROPPERPKT); //propPerPkt
+  public static int pktsPBBits = MathUtils.bitsToAddress(PKTSPERBRST); //pktsPerBurst
+  public static int NBRSETSWIDTH   = 64; //96 //Need a multiple number of nbr sets per brst
+  public static int NBRSETSPERBRST = BURSTWIDTH/NBRSETSWIDTH;
+  public static int NBRSETSPERPKT  = PKTWIDTH/NBRSETSWIDTH;
+  public static int nsPBBits       = MathUtils.bitsToAddress(NBRSETSPERBRST);
+  public static int nsPPBits       = MathUtils.bitsToAddress(NBRSETSPERPKT);
+
+  // Global BFS constants
+  public static int scalWidth = 32;  //width of scalar inputs/outputs
+  public static int bvCntBits = 32;
+  public static int nbrSetsCntBits = 16;
+  public static int curLvl = 0;
+  public static int coalesceNbrWidth = 24;
+  public static int coalesceAddrWidth = coalesceNbrWidth-pPBBits;
+
+  // Memory Request constants
+  public static int brstNbits = 28;
+  public static int sizeBits = 16;
+  public static int memReqWidth = brstNbits + sizeBits + 1;
+  
+  //public static int elemNbits = 8;
+
+  // BVCReader
+  public static int bvcFifoDepth = 256; //1024;  //HW
+
+  // NodeReader, EdgeReader
+  public static int nodeWidth = 24;
+
+  public static int numPktsBits = 16;
+  //public static int elemIdxRamDepth = 16384; //2k  //HW 
+  //public static int eIdxRamDepthBits = MathUtils.bitsToAddress(elemIdxRamDepth);
+
+  // PropReader RAM
+  public static int ePtrWidth = 24; //32;
+  public static int brstInc = 8; //brst grp size to request from memory at once
+  public static int threshLo = 128; //64 -- changed to match spmv
+  public static int threshHi = 1024; //420 -- changed to match spmv
+
+  public static int edgeWidth = 24;
+  public static int edgeIdxRamDepth = 8192; //added stall //16K--working //2k //HW 
+  public static int ePtrRamDepth = edgeIdxRamDepth;  //HW
+  public static int ePtrRamDepthBits = MathUtils.bitsToAddress(ePtrRamDepth);
+  public static int lvlReqRamDepth = 2048;
+  public static int bitmapDepth = 2*1024+1; //16*1024+1;  //HW
+
+  // ElemUpd
+  public static int nbrNumRamDepth = 512; //added stall //32768;  //HW
+  public static int nbrNumRamDepthBits = MathUtils.bitsToAddress(nbrNumRamDepth);
+    //UpdQueueSM
+    public static int orqDepth = 8; // few entries used, because sequential
+}

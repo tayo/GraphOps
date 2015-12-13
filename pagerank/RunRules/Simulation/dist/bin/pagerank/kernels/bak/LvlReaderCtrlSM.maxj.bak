@@ -1,0 +1,106 @@
+/*
+ * A Kernel State Machine that handles complex control signals for LvlReader
+ * kernel.  Outputs generated are:
+ *   incRdPtr for edgePtr RAMs
+ * Includes packet counter
+ */
+
+package graph_accel.kernels;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelLib;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmInput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmOutput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateValue;
+import com.maxeler.maxcompiler.v2.statemachine.kernel.KernelStateMachine;
+import com.maxeler.maxcompiler.v2.statemachine.types.DFEsmValueType;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.buffer.DFEsmFifo;
+import graph_accel.GC;
+
+public class LvlReaderCtrlSM extends KernelStateMachine {
+
+  DFEsmFifo numPktsFifo;
+
+  // I/O
+  private final DFEsmInput  iNumPktsVal;
+  private final DFEsmInput  iNumPkts;
+  private final DFEsmInput  iPktVal;
+  private final DFEsmOutput oIncRdPtr;
+  private final DFEsmOutput oPktCnt;
+
+  // State
+  private final DFEsmStateValue dbgCnt;
+  private final DFEsmStateValue pktCounter;
+  //private final DFEsmStateValue cntDone;
+  private final DFEsmStateValue dataAvail;
+
+  public LvlReaderCtrlSM(KernelLib owner, int cntWidth) {
+    super(owner);
+
+    DFEsmValueType counterType = dfeUInt(cntWidth);
+    numPktsFifo = buffer.fifo(counterType, GC.ePtrRamDepth);
+
+    // Inputs
+    iNumPktsVal  = io.input("numPktsVal", dfeBool());
+    iNumPkts     = io.input("numPkts", counterType);
+    iPktVal      = io.input("pktVal", dfeBool());
+    // Outputs
+    oIncRdPtr    = io.output("incRdPtr", dfeBool());
+    oPktCnt      = io.output("pktCnt", counterType); 
+    // State
+    dbgCnt     = state.value(dfeUInt(32), 0);
+    pktCounter = state.value(counterType, 0);
+    //cntDone    = state.value(dfeBool(), false);
+    dataAvail  = state.value(dfeBool(), false); // "empty" could mean one datum
+  }
+
+  @Override
+  protected void nextState() {
+    //cntDone.next <== false;
+    dbgCnt.next <== dbgCnt+1;
+    pktCounter.next <== pktCounter;
+    dataAvail.next  <== dataAvail;
+
+    numPktsFifo.input.dataIn <== iNumPkts;
+    numPktsFifo.input.writeEnable <== iNumPktsVal;
+    numPktsFifo.output.readEnable <== 0;
+
+    IF (~dataAvail & iNumPktsVal)
+      numPktsFifo.output.readEnable <== 1;
+
+    IF (~ numPktsFifo.output.empty) // "empty" could mean one datum 
+      dataAvail.next <== 1;
+    ELSE IF (dataAvail) { // empty & dataAvail = exactly one element in Fifo
+      IF (iNumPktsVal) 
+        dataAvail.next <== 1;
+      ELSE IF (iPktVal & pktCounter.eq(numPktsFifo.output.dataOut-1))
+        dataAvail.next <== 0;
+    }
+    ELSE { // empty & ~dataAvail = Fifo is completely empty
+      IF (iNumPktsVal)
+        dataAvail.next <== 1;
+      ELSE IF (iPktVal & pktCounter.eq(numPktsFifo.output.dataOut-1))
+        dataAvail.next <== 0; // empty Fifo is read and written simult
+    }
+
+    IF (iPktVal) { // the Fifo should never be empty here
+      // if all pkts for this set of edges have been received
+      IF (pktCounter.eq(numPktsFifo.output.dataOut-1)) {
+        numPktsFifo.output.readEnable <== 1;
+        pktCounter.next <== 0;
+        //cntDone.next <== true;
+      } ELSE {
+        pktCounter.next <== pktCounter+1;
+      }
+    }
+  }
+
+  @Override
+  protected void outputFunction() {
+    oIncRdPtr <== iPktVal & (pktCounter.eq(numPktsFifo.output.dataOut-1));
+    oPktCnt <== pktCounter;
+
+    debug.printf("LvlRdrCtrlSM: %d : nPkts=%d, nPktsVal=%d, pktVal=%d, oInc=%d, oPktCnt=%d\n",
+                 dbgCnt, iNumPkts, iNumPktsVal, iPktVal, oIncRdPtr, oPktCnt);
+    debug.printf("    dataAvail=%d, fifo.output=%d, fifo.empty=%d\n",
+                 dataAvail, numPktsFifo.output.dataOut, numPktsFifo.output.empty);
+  }
+}

@@ -1,0 +1,314 @@
+package conduct.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.SMIO;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.IO.*;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.WrapMode;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.memory.Memory;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Stream.OffsetExpr;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Accumulator;
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+import conduct.blocks.*;
+import conduct.GC;
+
+/*
+ * - Read sequentially through prop48 array.  Use per-node prop data to generate
+ *   filters and do reduction.
+ * - Use scalar outputs to send reduction results to host
+ * - Output node numbers of elements which fit the required filter
+ */
+public class AllNodePropRed extends Kernel {
+
+  // return value is select control of mux
+  private DFEVar prArb(int width, DFEVar req, DFEVar base) {
+    DFEVar doubleReq = (req # req).cast(dfeUInt(2*width));
+    DFEVar diff = doubleReq - base.cast(dfeUInt(2*width));
+    DFEVar doubleGrant = doubleReq & ~diff;
+    DFEVar grant = doubleGrant.slice(0, width) | doubleGrant.slice(width, width);
+    return grant; // return value can be RawBits, so no need to cast
+    //return grant.cast(dfeUInt(width));
+  }
+
+  private void printArray(DFEVar ctrl, DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf(ctrl, "%d ", ar[size-1-i]); 
+    }
+  }
+
+  private void printArrayProp(DFEVar ctrl, DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf(ctrl, "[%d|%d] ", ar[size-1-i].slice(16,32).cast(dfeUInt(32)), 
+                                  ar[size-1-i].slice(0,16).cast(dfeUInt(16))); 
+      //debug.printf(ctrl, "%d ", ar[size-1-i]); 
+    }
+  }
+
+  public AllNodePropRed(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(64);
+    // Scalar Inputs
+    DFEVar uDVal       = io.scalarInput("uDVal", dfeUInt(32));
+    DFEVar dbgStartCnt = io.scalarInput("StartCnt", dfeUInt(64));
+    // propAddr: address of the prop48 array
+    DFEVar propAddr    = io.scalarInput("propAddr", dfeUInt(GC.scalWidth));
+    int numNodesWidth  = 32;
+    DFEType numNodesType = dfeUInt(numNodesWidth);
+    DFEVar scalN       = io.scalarInput("NumNodes", numNodesType);
+    DFEVar conductNum  = io.scalarInput("conductNum", dfeUInt(16));
+    DFEVar throtMax    = io.scalarInput("throtMax" , dfeUInt(32));
+
+    DFEVar begin    = cnt.eq(dbgStartCnt);
+    DFEVar endN     = scalN;
+
+    // Types
+    int arSize = GC.PKTWIDTH/GC.PROPWIDTH;
+    DFEType arPropType = dfeUInt(GC.PROPWIDTH);
+    DFEArrayType<DFEVar> arrayType = new DFEArrayType<DFEVar>(arPropType, arSize);
+    DFEType nodeType = dfeUInt(GC.nodeWidth);
+
+    // Inputs from DRAM
+    NonBlockingInput<DFEArray<DFEVar>> propArray_In = 
+      io.nonBlockingInput("propArray", arrayType, constant.var(true), 1,
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEArray<DFEVar> propArray = propArray_In.data;
+    DFEVar arrayCtrl           = propArray_In.valid;
+
+    int endBrstWidth = numNodesWidth - GC.pPBBits;
+    DFEVar endBrst = endN.slice(GC.pPBBits, endBrstWidth).cast(dfeUInt(endBrstWidth));
+    DFEVar endPkt  = endN.slice(GC.pPPBits, GC.pktsPBBits).cast(dfeUInt(GC.pktsPBBits));
+
+    // Feedback stall input from reducer
+    NonBlockingInput<DFEVar> outputStall_In =
+      io.nonBlockingInput("outputStall", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar outputStall = Reductions.streamHold(outputStall_In.data, outputStall_In.valid,
+                                               dfeBool().encodeConstant(false));
+
+    // Counter to track number of packets
+    Count.Params pktCntParams = control.count.makeParams(GC.pktsPBBits)
+        .withEnable(arrayCtrl);
+    Counter pktCounter = control.count.makeCounter(pktCntParams);
+    DFEVar pktCnt = pktCounter.getCount();
+    // Counter tracking number of bursts arrived
+    int brstCntbits = endBrstWidth;
+    Count.Params brstCntParams = control.count.makeParams(brstCntbits)
+        .withReset(begin)
+        .withEnable(pktCounter.getWrap());
+    DFEVar brstCnt = (control.count.makeCounter(brstCntParams)).getCount();
+
+    // Signals to determine packet mask
+    DFEVar lastIdx = endN.slice(0, GC.pPPBits).cast(dfeUInt(GC.pPPBits));
+    DFEVar goodBrst = brstCnt <= endBrst;
+    DFEVar goodPkt  = arrayCtrl & ((brstCnt<endBrst)|(pktCnt<=endPkt));
+    DFEVar lastPkt  = arrayCtrl & brstCnt.eq(endBrst) & pktCnt.eq(endPkt);
+    DFEVar notLastPkt = goodBrst & goodPkt & ~lastPkt;
+    DFEVar[] lastPktVal = new DFEVar[arSize];
+    DFEVar[] pktMask = new DFEVar[arSize];
+
+    // Throttle emission of nodes to subsequent kernels
+    // use wrap signal to determine when valid to read from fifo and send node
+    Count.Params throtCntParams = control.count.makeParams(32)
+        .withEnable(constant.var(true))
+        .withMax(throtMax)
+        .withWrapMode(WrapMode.COUNT_LT_MAX_THEN_WRAP);
+    Counter throtCounter = control.count.makeCounter(throtCntParams);
+    DFEVar emitNode   = ~outputStall & throtCounter.getWrap();
+
+    // Structures for output Fifos
+    SMIO[] outNodeFifo = new SMIO[arSize];
+    OffsetExpr rdEnLoopLen = stream.makeOffsetAutoLoop("rdEnLoopLen");
+    DFEVar rdEn = dfeRawBits(arSize).newInstance(this);
+    DFEVar[] outNodeOutputs = new DFEVar[arSize];
+    DFEArrayType<DFEVar> boolArray =
+      new DFEArrayType<DFEVar>(dfeBool(), arSize);
+    DFEArray<DFEVar> outNodeAvail  = boolArray.newInstance(this);
+    DFEArray<DFEVar> outNodeStall  = boolArray.newInstance(this);
+    DFEVar nodeToSend = dfeUInt(32).newInstance(this);
+
+    // two fltrRes arrays, two data arrays:  one for each reduction tree
+    DFEVar[] fltr0 = new DFEVar[arSize];
+    DFEVar[] fltr1 = new DFEVar[arSize];
+    DFEVar[] dInData  = new DFEVar[arSize];
+    DFEVar[] dOutData = new DFEVar[arSize];
+
+    // Generate output node base nubmer
+    DFEVar bufZeros = constant.var(dfeUInt(GC.pPPBits), 0);
+    DFEVar baseNode = (brstCnt # pktCnt # bufZeros).cast(numNodesType);
+
+    int fifoWidth = 32;
+    int fifoDepth = GC.bvcFifoDepth;
+    for (int i = 0; i < arSize; i++) {
+      // Generate masks
+      lastPktVal[i] = lastPkt & (i < lastIdx);
+      pktMask[i]    = notLastPkt | lastPktVal[i];
+
+      DFEVar propMbr = propArray[i].slice(0, 16).cast(dfeUInt(16));
+      DFEVar propDeg = propArray[i].slice(16, 32).cast(dfeUInt(32));
+      fltr0[i] = pktMask[i] & (propMbr.eq(conductNum));
+      fltr1[i] = pktMask[i] & (propMbr.neq(conductNum));
+
+      dInData[i]  = fltr0[i] ? propDeg : constant.var(dfeUInt(32), 0);
+      dOutData[i] = fltr1[i] ? propDeg : constant.var(dfeUInt(32), 0);
+
+      // Output Fifos
+      // Use fltr0 as wrEn. generate nodeNumbers using the brstCnt and pktCnt
+      // Use the nodeNumbers as inputs to the outputFifos
+      // Output these elements to next kernel.  Apply emit throttling to output
+      outNodeFifo[i] = addStateMachine("OutNodeFifo"+i,
+                                       new FifoKernelStallSM(this, fifoWidth, fifoDepth));
+      outNodeFifo[i].connectInput("dataIn" , baseNode+i);
+      outNodeFifo[i].connectInput("dataVal", fltr0[i]);
+      outNodeFifo[i].connectInput("readEn" , emitNode &
+                                  rdEn.slice(i).cast(dfeBool()));
+      outNodeOutputs[i] = outNodeFifo[i].getOutput("dataOut");
+      outNodeAvail[i] <== outNodeFifo[i].getOutput("dataRdy");
+      outNodeStall[i] <== outNodeFifo[i].getOutput("dataStall");
+    }
+
+    DFEVar tmpBaseCnt = control.count.simpleCounter(GC.pPPBits);
+    DFEVar arbBaseCnt = constant.var(dfeUInt(GC.PROPPERPKT), 1) << tmpBaseCnt;
+    DFEVar arbReq = outNodeAvail.pack();
+    rdEn <== prArb(arSize, stream.offset(arbReq, -rdEnLoopLen), arbBaseCnt);
+
+    nodeToSend <== control.oneHotMux(rdEn, outNodeOutputs);
+    DFEVar muxVal = (arbReq & rdEn).cast(dfeUInt(arSize)).neq(0);
+    DFEVar sendNode = muxVal & emitNode;
+
+    // Reduction tree #0 (Din)
+    DFEVar dInTmp = 
+    (( (dInData[15]+dInData[14])+ (dInData[13]+dInData[12]))+
+    (  (dInData[11]+dInData[10])+ (dInData[ 9]+dInData[ 8])) )+ 
+    ( ((dInData[ 7]+dInData[ 6])+ (dInData[ 5]+dInData[ 4]))+ 
+    (  (dInData[ 3]+dInData[ 2])+ (dInData[ 1]+dInData[ 0])) );
+    DFEVar clrResult = stream.offset(pktCounter.getWrap(), -1);
+    DFEVar dInReg0 = Reductions.streamHold(dInTmp, pktCnt.eq(0)|clrResult,
+                                           dfeUInt(32).encodeConstant(0));
+    DFEVar dInReg1 = Reductions.streamHold(dInTmp, pktCnt.eq(1)|clrResult,
+                                           dfeUInt(32).encodeConstant(0));
+    DFEVar dInRegRes = dInReg0 + dInReg1;
+    Accumulator.Params aP = Reductions.accumulator.makeAccumulatorConfig(dfeUInt(32))
+      .withEnable(pktCounter.getWrap());
+    DFEVar dInRes = Reductions.accumulator.makeAccumulator(dInRegRes, aP);
+
+    // Reduction tree #1 (Dout)
+    DFEVar dOutTmp = 
+    (( (dOutData[15]+dOutData[14])+ (dOutData[13]+dOutData[12]))+
+    (  (dOutData[11]+dOutData[10])+ (dOutData[ 9]+dOutData[ 8])) )+ 
+    ( ((dOutData[ 7]+dOutData[ 6])+ (dOutData[ 5]+dOutData[ 4]))+ 
+    (  (dOutData[ 3]+dOutData[ 2])+ (dOutData[ 1]+dOutData[ 0])) );
+    DFEVar dOutReg0 = Reductions.streamHold(dOutTmp, pktCnt.eq(0)|clrResult,
+                                           dfeUInt(32).encodeConstant(0));
+    DFEVar dOutReg1 = Reductions.streamHold(dOutTmp, pktCnt.eq(1)|clrResult,
+                                           dfeUInt(32).encodeConstant(0));
+    DFEVar dOutRegRes = dOutReg0 + dOutReg1;
+    DFEVar dOutRes = Reductions.accumulator.makeAccumulator(dOutRegRes, aP);
+
+    io.scalarOutput("scalarOut_0", dInRes,  dfeUInt(32));
+    io.scalarOutput("scalarOut_1", dOutRes, dfeUInt(32));
+    ///////////////////////////////////////
+
+
+    // Logic for requesting more data
+    int brstInc     = GC.brstInc;   //brst grp size to request at once
+    int brstIncBits = MathUtils.bitsToAddress(brstInc);
+      // Throttling:
+      // Use the full signals from the output fifo buffers to determine when to
+      // pause requesting.
+      DFEVar fifosFullRaw  = outNodeStall.pack();
+      DFEVar stall     = fifosFullRaw.cast(dfeUInt(arSize)).neq(0);
+      DFEVar stallPrev = stream.offset(stall, -1);
+      DFEVar doneStall = stallPrev & ~stall;
+    DFEVar brstNumInGrp = brstCnt.slice(0,brstIncBits).cast(dfeUInt(brstIncBits));
+    DFEVar almostDone   = brstNumInGrp.eq(brstInc-1); //last brst in grp
+    DFEVar elemsSoFar   = (brstCnt << GC.pPBBits).cast(numNodesType);
+    DFEVar moreToRd     = endN > (elemsSoFar); // + GC.NODESPERBRST);
+    DFEVar reqMore      = (~stall & almostDone & moreToRd & 
+                           (arrayCtrl & pktCnt.eq(0))) |
+                          (doneStall & moreToRd);
+    DFEVar reqStart     = begin;
+
+    // give time for data to propagate through fifos
+    DFEVar arrayCtrlDD = stream.offset(arrayCtrl, -2); 
+    DFEVar dataArrived = Reductions.streamHold(constant.var(true), arrayCtrlDD,
+                                               dfeBool().encodeConstant(false));
+    // Determine when the kernel has finished processing
+    DFEVar done    = dataArrived & arbReq.cast(dfeUInt(arSize)).eq(0); 
+    DFEVar knlDone = done;
+    DFEVar knlDonePrev = stream.offset(knlDone, -1);
+    DFEVar doneVal  = knlDone &  knlDonePrev;
+    Count.Params sendDoneParams = control.count.makeParams(32)
+      .withEnable(doneVal);
+      //.withReset(clrDone);
+    DFEVar sendDoneCnt = (control.count.makeCounter(sendDoneParams)).getCount();
+    DFEVar sendLength = uDVal*2;
+    DFEVar sendDone = knlDone & (sendDoneCnt < sendLength);
+    // output to Done kernel
+    io.output("idle", knlDone, dfeBool(), sendDone);
+
+    // Output to MemUnit: read prop array
+    DFEType reqAddrType = dfeUInt(GC.brstNbits);
+    DFEType reqSizeType = dfeUInt(GC.sizeBits);
+    DFEVar propAddrBase = propAddr.cast(reqAddrType);
+    DFEVar req_brst_addr = propAddrBase +
+                           brstCnt.cast(reqAddrType) +
+                           almostDone.cast(reqAddrType);
+    DFEVar req_size = constant.var(reqSizeType, brstInc);
+    DFEVar req_en = reqStart | reqMore;
+    io.output("memReq", req_size#req_brst_addr#req_en, dfeRawBits(GC.memReqWidth));
+
+    // Output to nbr reader
+    io.output("ndNum", nodeToSend, dfeUInt(32), sendNode);
+
+
+    // debug
+    DFEVar TR = constant.var(true);
+    debug.printf("AllNodePropRed: cnt=%d, arrayCtrl=%d, propAddr=%d, N=%d, condNum=%d, outputStall=%d\n",
+      cnt, arrayCtrl, propAddr, scalN, conductNum, outputStall);
+    debug.printf(arrayCtrl, "    arrayCtrl=%d, propArray = ", arrayCtrl);
+      printArrayProp(arrayCtrl, propArray.elementsAsArray(), arSize);
+      debug.printf(arrayCtrl, "\n");
+    debug.printf("    begin=%d, pktCnt=%d, brstCnt=%d, endBrst=%d, endPkt=%d, emitNode=%d, baseNode=%d\n", 
+      begin, pktCnt, brstCnt, endBrst, endPkt, emitNode, baseNode);
+    debug.printf("    fltr0 =  ");
+      for (int i = 0; i < arSize; i++) {debug.printf("%d ", fltr0[arSize-1-i]);} debug.printf("\n");
+    debug.printf("    dInData =  ");
+      for (int i = 0; i < arSize; i++) {debug.printf("%d ", dInData[arSize-1-i]);} debug.printf("\n");
+    debug.printf("    Reduction0: clrResult=%d, reg0=%d, reg1=%d, regRes=%d, dInRes=%d\n",
+      clrResult, dInReg0, dInReg1, dInRegRes, dInRes);
+    debug.printf("    fltr1 =  ");
+      for (int i = 0; i < arSize; i++) {debug.printf("%d ", fltr1[arSize-1-i]);} debug.printf("\n");
+    debug.printf("    dOutData =  ");
+      for (int i = 0; i < arSize; i++) {debug.printf("%d ", dOutData[arSize-1-i]);} debug.printf("\n");
+    debug.printf("    Reduction1: clrResult=%d, reg0=%d, reg1=%d, regRes=%d, dOutRes=%d\n",
+      clrResult, dOutReg0, dOutReg1, dOutRegRes, dOutRes);
+    debug.printf("    OutNodeFifos: pktMask = ");
+      printArray(TR, pktMask, arSize);  debug.printf("\n");
+    debug.printf("    outNodeAvail= ");
+      printArray(TR, outNodeAvail.elementsAsArray(), arSize); debug.printf("\n");
+    debug.printf("    outNodeRdEn = %o\n", rdEn);
+    debug.printf("    outNodeOutputs =  ");
+      printArray(TR, outNodeOutputs, arSize); debug.printf("\n");
+    debug.printf("    outNodeStall = ");
+      printArray(TR, outNodeStall.elementsAsArray(), arSize); debug.printf("\n");
+    debug.printf("    OUTPUT: sendNode=%d, muxVal=%d, nodeToSend=%d\n",
+      sendNode, muxVal, nodeToSend);
+    debug.printf("    brstNumInGrp=%d, almostDone=%d, moreToRd=%d, eSoFar=%d, stall=%d, doneStall=%d\n",
+      brstNumInGrp, almostDone, moreToRd, elemsSoFar, stall, doneStall);
+    debug.printf("    reqStart=%d, reqMore=%d, knlDone=%d\n",
+      reqStart, reqMore, knlDone);
+    debug.printf("    prop memReq: req_brst_addr=%d, req_en=%d, req_size=%d\n", 
+      req_brst_addr, req_en, req_size);
+
+    // a watch variable seems necessary for debug.printf to work
+    cnt.watch("cnt"); 
+    flush.onTrigger(constant.var(false));
+  }
+}

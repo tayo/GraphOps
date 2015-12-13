@@ -1,0 +1,257 @@
+package pagerank.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.IO.*;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.memory.Memory;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Stream.OffsetExpr;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+//import com.maxeler.maxcompiler.v2.kernelcompiler.SMIO;
+//import pagerank.blocks.*;
+import pagerank.GC;
+
+public class ForAllPropRdr extends Kernel {
+
+  private void printArray(DFEVar ctrl, DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf(ctrl, "%d ", ar[size-1-i]); 
+    }
+  }
+
+  public ForAllPropRdr(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(64);
+    // Scalar Inputs
+    DFEVar dbgStartCnt = io.scalarInput("StartCnt", dfeUInt(64));
+    DFEVar nodeAddr    = io.scalarInput("nodeAddr", dfeUInt(GC.scalWidth));
+    // propAddr should be the address of the replicated property array
+    DFEVar propAddr    = io.scalarInput("propAddr", dfeUInt(GC.scalWidth));
+    int numNodesWidth  = 32;
+    DFEType numNodesType = dfeUInt(numNodesWidth);
+    DFEVar scalN       = io.scalarInput("NumNodes", numNodesType);
+
+    DFEVar begin    = cnt.eq(dbgStartCnt);
+
+    // Types
+    int arSize = GC.PKTWIDTH/GC.NODEWIDTH;
+    DFEType nodeType = dfeUInt(GC.NODEWIDTH);
+    DFEArrayType<DFEVar> arrayType = new DFEArrayType<DFEVar>(nodeType, arSize);
+
+    // Inputs from DRAM:  node arrays, list of edge pointers
+    NonBlockingInput<DFEArray<DFEVar>> nodeArray_In = 
+      io.nonBlockingInput("nodeArray", arrayType, constant.var(true), 1,
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEArray<DFEVar> nodeArray = nodeArray_In.data;
+    DFEVar arrayCtrl           = nodeArray_In.valid;
+
+    int endBrstWidth = numNodesWidth - GC.nPBBits;
+    DFEVar endBrst = scalN.slice(GC.nPBBits, endBrstWidth).cast(dfeUInt(endBrstWidth));
+    DFEVar endPkt  = scalN.slice(GC.nPPBits, GC.pktsPBBits).cast(dfeUInt(GC.pktsPBBits));
+
+    // Counter to track number of packets
+    Count.Params pktCntParams = control.count.makeParams(GC.pktsPBBits)
+        .withEnable(arrayCtrl);
+    Counter pktCounter = control.count.makeCounter(pktCntParams);
+    DFEVar pktCnt = pktCounter.getCount();
+    // Counter tracking number of bursts arrived
+    int brstCntbits = endBrstWidth;
+    Count.Params brstCntParams = control.count.makeParams(brstCntbits)
+        .withReset(begin)
+        .withEnable(pktCounter.getWrap());
+    DFEVar brstCnt = (control.count.makeCounter(brstCntParams)).getCount();
+
+
+    // Node-array fifos
+    DFEVar numNodesIdx = scalN.slice(0, GC.nPPBits).cast(dfeUInt(GC.nPPBits));
+    DFEVar goodBrst = brstCnt <= endBrst;
+    DFEVar goodPkt  = arrayCtrl & ((brstCnt<endBrst)|(pktCnt<=endPkt));
+    DFEVar lastPkt  = arrayCtrl & brstCnt.eq(endBrst) & pktCnt.eq(endPkt);
+    DFEVar notLastPkt = goodBrst & goodPkt & ~lastPkt;
+    DFEVar[] lastPktVal = new DFEVar[arSize];
+    DFEVar[] pktMask = new DFEVar[arSize];
+
+    Memory <DFEVar> [] nodeFifos = new Memory[arSize];
+    DFEVar[] fifoOutputs = new DFEVar[arSize];
+
+    /*
+    //--Code for using Memory structure instead of FifoKernelSM
+    SMIO [] nodeFifos = new SMIO[arSize];
+    OffsetExpr rdEnLoopLen = stream.makeOffsetAutoLoop("rdEnLoopLen");
+    DFEVar nodeFifoRdEn = dfeRawBits(arSize).newInstance(this);
+    DFEArrayType<DFEVar> boolArray =
+      new DFEArrayType<DFEVar>(dfeBool(), arSize);
+    DFEArray<DFEVar> nodeAvail = boolArray.newInstance(this);
+    */
+
+    // Counter to throttle emission of requests: every 2^(tnBits) cycles
+    int tnBits = 1; // for tnBits=1, emit request every two cycles, etc
+    Count.Params emitCntParams = control.count.makeParams(tnBits)
+        .withEnable(constant.var(true));
+    // use wrap signal of this counter to determine when valid to emit request
+    Counter emitCounter = control.count.makeCounter(emitCntParams); 
+
+    OffsetExpr rdEnLoopLen = stream.makeOffsetAutoLoop("rdEnLoopLen");
+    DFEVar nodeFifoRdEn = dfeBool().newInstance(this);
+    // read- and write-pointers
+    int fifoWidth = 32;
+    int fifoDepth = 32;
+    int fifoPtrBits = MathUtils.bitsToAddress(fifoDepth);
+    Count.Params ramRdPtrParams = control.count.makeParams(fifoPtrBits) //RdPtr
+        .withEnable(nodeFifoRdEn);
+    Count.Params ramWrPtrParams = control.count.makeParams(fifoPtrBits) //WrPtr
+        .withEnable(arrayCtrl);
+    Counter ramRdPtrCounter = control.count.makeCounter(ramRdPtrParams);
+    Counter ramWrPtrCounter = control.count.makeCounter(ramWrPtrParams);
+    DFEVar ramRdPtr = ramRdPtrCounter.getCount();
+    DFEVar ramWrPtr = ramWrPtrCounter.getCount();
+    DFEType fifoElemType = dfeUInt(fifoWidth);
+
+    for (int i = 0; i < arSize; i++) {
+      // Generate masks
+      lastPktVal[i] = lastPkt & (i < numNodesIdx);
+      pktMask[i]    = notLastPkt | lastPktVal[i];
+
+      // Fifos to store incoming nodes
+      //--Code for using Memory structure instead of FifoKernelSM
+      nodeFifos[i] = mem.alloc( fifoElemType , fifoDepth );
+      nodeFifos[i].write( ramWrPtr, 
+                          nodeArray[i].slice(0,fifoWidth).cast(fifoElemType),
+                          pktMask[i] );
+      fifoOutputs[i] = nodeFifos[i].read(ramRdPtr);
+      /*
+      //--Code for using FifoKernelSM
+      nodeFifos[i] = addStateMachine("nodeFifo"+i,
+                                     new FifoKernelSM(this, fifoWidth, fifoDepth));
+      nodeFifos[i].connectInput("dataIn",
+                                nodeArray[i].slice(0,fifoWidth).cast(fifoElemType));
+      nodeFifos[i].connectInput("dataVal", pktMask[i]);
+      nodeFifos[i].connectInput("readEn", nodeFifoRdEn.slice(i).cast(dfeBool()));
+      fifoOutputs[i] = nodeFifos[i].getOutput("dataOut");
+      nodeAvail[i] <== nodeFifos[i].getOutput("dataRdy");
+      */
+    }
+
+    
+    DFEVar dataArrived = Reductions.streamHold(constant.var(true), arrayCtrl,
+                                               dfeBool().encodeConstant(false));
+    /*
+    // Track number of potential nodes in the fifos (count up)
+    OffsetExpr nodesCntLoopLen = stream.makeOffsetAutoLoop("nodesCntLoopLen");
+    DFEVar prevNodesCnt = numNodesType.newInstance(this);
+    DFEVar nodesCnt = Reductions.streamHold(prevNodesCnt+arSize,
+                                            arrayCtrl,
+                                            numNodesType.encodeConstant(0));
+    prevNodesCnt <== stream.offset(nodesCnt, -nodesCntLoopLen); 
+    DFEVar nodesAvail = nodesCnt > 0;
+    */
+
+    /*
+    // Signal to determine whether there are pending nodes in fifos (count down)
+    OffsetExpr nodesLeftLoopLen = stream.makeOffsetAutoLoop("nodesLeftLoopLen");
+    DFEVar prevNodesLeft = numNodesType.newInstance(this);
+    DFEVar cntNode = nodesAvail & (prevNodesLeft>0) & emitCounter.getWrap();
+    DFEVar nodesLeft = Reductions.streamHold(prevNodesLeft-1, cntNode, 
+                                                  numNodesType.encodeConstant(GC.N));
+    prevNodesLeft <== stream.offset(nodesLeft, -nodesLeftLoopLen);
+    */
+    DFEVar emit = dataArrived & emitCounter.getWrap(); // & (nodesLeft > 0)
+
+    // Counter to choose element to select in mux
+    int muxSelBits = MathUtils.bitsToAddress(arSize);
+    Count.Params muxSelCntParams = control.count.makeParams(muxSelBits)
+        .withEnable(emit);
+    Counter muxSelCounter = control.count.makeCounter(muxSelCntParams);
+    nodeFifoRdEn <== muxSelCounter.getWrap();
+
+    DFEVar muxSel   = muxSelCounter.getCount();
+    DFEVar muxSelP1 = muxSel + 1;  //TODO: Handle overflow case.  See EdgeRdr example
+                                   //TODO: Increment fifos when this counter wraps
+
+    DFEVar node0 = control.mux(muxSel, fifoOutputs);
+    DFEVar node1 = control.mux(muxSelP1, fifoOutputs);
+
+
+    int brstInc     = 2;   //brst grp size to request at once
+    int brstIncBits = MathUtils.bitsToAddress(brstInc);
+    DFEVar elemsSoFar   = (brstCnt << GC.nPBBits).cast(numNodesType);
+    DFEVar brstNumInGrp = brstCnt.slice(0,brstIncBits).cast(dfeUInt(brstIncBits));
+    DFEVar almostDone   = brstNumInGrp.eq(brstInc-1); //last brst in grp
+    DFEVar moreToRd     = scalN > (elemsSoFar + GC.NODESPERBRST);
+    DFEVar reqMore      = almostDone & moreToRd & (arrayCtrl & pktCnt.eq(0));
+    DFEVar reqStart     = begin;
+
+    /**
+     * TODOs above
+     * ADD done signal
+     * CHECK  overflow->ramRd signal works properly
+     */ 
+
+    // Output to MemUnit: read node array
+    DFEType reqAddrType = dfeUInt(GC.brstNbits);
+    DFEType reqSizeType = dfeUInt(GC.sizeBits);
+    DFEVar nodeAddrBase = nodeAddr.cast(reqAddrType);
+    DFEVar req_brst_addr = nodeAddrBase +
+                           brstCnt.cast(reqAddrType) +
+                           reqMore.cast(reqAddrType);
+    DFEVar req_size = constant.var(reqSizeType, brstInc);
+    DFEVar req_en = reqStart | reqMore;
+    io.output("memReq", req_size#req_brst_addr#req_en, dfeRawBits(GC.memReqWidth));
+
+    // Output to MemUnit: read replicated property array, for the reducer
+    DFEVar propAddrBase = propAddr.cast(reqAddrType);
+    int buf = fifoWidth - GC.nPBBits;
+    int prefixZeros = GC.brstNbits - buf;
+    DFEVar zeros = constant.var(dfeUInt(prefixZeros), 0);
+    DFEVar propBrst0 = (zeros#node0.slice(GC.nPBBits, buf)).cast(reqAddrType);
+    DFEVar propBrst1 = (zeros#node1.slice(GC.nPBBits, buf)).cast(reqAddrType);
+    DFEVar propBrsts = propBrst1-propBrst0+1;
+    DFEVar req_size_rep      = propBrsts.cast(reqSizeType);
+    DFEVar req_en_rep        = emit;
+    DFEVar req_brst_addr_rep = propAddrBase + propBrst0;
+    io.output("memReqRep", req_size_rep#req_brst_addr_rep#req_en_rep,
+              dfeRawBits(GC.memReqWidth));
+
+    // Output to reducer
+    DFEVar propPkts    = propBrsts << GC.pktsPBBits;
+    DFEVar propPkts_   = propPkts.slice(0, GC.numPktsBits);
+    DFEVar nodePtr0_   = node0.slice(0, GC.ePtrWidth);
+    DFEVar nodePtr1_   = node1.slice(0, GC.ePtrWidth);
+    int ptrDataWidth = fifoWidth + GC.numPktsBits + GC.ePtrWidth + GC.ePtrWidth;
+    io.output("repPtrData", node0#propPkts_#nodePtr1_#nodePtr0_,
+              dfeRawBits(ptrDataWidth), req_en_rep);
+
+    // debug
+    debug.printf("ForAllPropRdr: cnt=%d, arrayCtrl=%d, nodeAddr=%d, propAddr=%d, N=%d\n",
+      cnt, arrayCtrl, nodeAddr, propAddr, scalN);
+    debug.printf(arrayCtrl, "    arrayCtrl=%d, nodeArray = ", arrayCtrl);
+      printArray(arrayCtrl, nodeArray.elementsAsArray(), arSize);
+      debug.printf(arrayCtrl, "\n");
+    debug.printf("    begin=%d, pktCnt=%d, brstCnt=%d, endBrst=%d, endPkt=%d\n", 
+      begin, pktCnt, brstCnt, endBrst, endPkt);
+    debug.printf("    ramRdPtr=%d, ramWrPtr=%d, fifoRdEn=%d, reqMore=%d, elemsSoFar=%d\n",
+      ramRdPtr, ramWrPtr, nodeFifoRdEn, reqMore, elemsSoFar);
+    debug.printf("    fifos: pktMask = ");
+      printArray(constant.var(true), pktMask, arSize);  debug.printf("\n");
+    debug.printf("           fifoOutputs = ");
+      printArray(constant.var(true), fifoOutputs, arSize);  debug.printf("\n");
+    debug.printf("    muxSelCnt=%d, nodesCnt=%d, nodesAvail=%d, prevNodesLeft=%d, nodesLeft=%d\n",
+      muxSelCounter.getCount(), nodesCnt, nodesAvail, prevNodesLeft, nodesLeft);
+    debug.printf("    node0=%d, node1=%d\n",
+      node0, node1);
+    debug.printf("    nodeReq: req_brst_addr=%d, req_en=%d, req_size=%d\n", 
+      req_brst_addr, req_en, req_size);
+    debug.printf("    propReq: req_brst_addr=%d, req_en=%d, req_size=%d, propBrsts=%d\n", 
+      req_brst_addr_rep, req_en_rep, req_size_rep, propBrsts);
+
+    // a watch variable seems necessary for debug.printf to work
+    cnt.watch("cnt"); 
+    flush.onTrigger(constant.var(false));
+  }
+}

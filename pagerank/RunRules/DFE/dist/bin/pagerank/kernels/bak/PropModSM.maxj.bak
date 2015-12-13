@@ -1,0 +1,400 @@
+/* 
+ * Property Modification SM
+ * A Manager State Machine that resolves memory consistency issues.
+ * It tracks outstanding read requests and overwrites them if a write request
+ * arrives while the read request is outstanding.
+ *
+ * Designed for BFS property update semantics:
+ *   - Priorities given to writes: an incoming write goes to head of queue.
+ *   - Limit to size 1 reads/writes (used for property updates)
+ * 
+ * Use LUTs for all storage because all data needs to be accessible in same
+ * cycle.  Could switch to BRAMs and increase latency of the unit.
+ */
+
+package graph_accel.kernels;
+
+import com.maxeler.maxcompiler.v2.managers.DFEManager;
+import com.maxeler.maxcompiler.v2.statemachine.manager.DFEsmPullInput;
+import com.maxeler.maxcompiler.v2.statemachine.manager.DFEsmPullOutput;
+import com.maxeler.maxcompiler.v2.statemachine.manager.DFEsmPushOutput;
+import com.maxeler.maxcompiler.v2.statemachine.manager.DFEsmPushInput;
+import com.maxeler.maxcompiler.v2.statemachine.manager.ManagerStateMachine;
+import com.maxeler.maxcompiler.v2.statemachine.types.DFEsmValueType;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateValue;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmValue;
+//import com.maxeler.maxcompiler.v2.statemachine.stdlib.Buffer;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.buffer.DFEsmFifo;
+
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+import graph_accel.GC;
+
+
+public class PropModSM extends ManagerStateMachine {
+
+    //private final DFEsmPushInput rdReqAddr, rdReqSize, rdReqCtrl;
+    //private final DFEsmPushOutput rdReqAddrOut, rdReqSizeOut, rdReqCtrlOut;
+  private final DFEsmPushInput rdReq;
+  private final DFEsmPushOutput rdReqOut;
+    //private final DFEsmPushInput wrReqAddr, wrReqSize, wrReqCtrl;
+    //private final DFEsmPushOutput wrReqAddrOut, wrReqSizeOut, wrReqCtrlOut;
+  private final DFEsmPushInput wrReq;
+  private final DFEsmPushOutput wrReqOut;
+
+  private final DFEsmPullInput rdDataIn;    // from DRAM
+  private final DFEsmPullOutput rdDataOut;  // to reader 
+
+  private final DFEsmPushInput wrDataIn;    // from write requester
+  private final DFEsmPushOutput wrDataOut;  // to DRAM
+
+  private final DFEsmStateValue dbgCnt;
+  
+  
+  DFEsmValueType reqAddrType;
+  DFEsmValueType reqSizeType;
+  DFEsmValueType reqCtrlType;
+  DFEsmValueType pktType;
+  DFEsmValueType int32Type;
+  DFEsmValueType memReqType;
+
+  // outstanding request queue
+  private final int orqDepth = 256;
+  private final int orqPtrWidth = MathUtils.bitsToAddress(orqDepth);
+  DFEsmStateValue[] orqAddr;
+  DFEsmStateValue[] orqInv;
+  DFEsmStateValue[] orqVal;
+  DFEsmStateValue[] orqWrQIdx;
+  DFEsmStateValue   orqRdPtr;
+  DFEsmStateValue   orqWrPtr;
+  //DFEsmStateValue orqSize[orqDepth];  // all burst sizes are 1
+  
+  // write queue
+  private final int numWrReqs = 16;
+  private final int wrDataQDepth = numWrReqs*GC.PKTSPERBRST;
+  private final int wrDataQPtrWidth = MathUtils.bitsToAddress(wrDataQDepth);
+  private final int wrQPtrWidth = MathUtils.bitsToAddress(numWrReqs);
+  //DFEsmStateValue   wrQRdPtr;
+  DFEsmStateValue   wrQWrPtr;
+  DFEsmStateValue[] wrQData;
+  //DFEsmStateValue[] wrQOrqIdx;
+  DFEsmStateValue[] wrQVal;
+  //wrDataQ pointers achieved by ptr<<GC.PKTSPERBRST
+
+  // incoming read data state
+  DFEsmFifo rdBuf;  // buffer to store data to be sent to reader
+  DFEsmStateValue rdDataInVal;
+  DFEsmStateValue rdDataPktCtr;
+  DFEsmStateValue wrQIdx;
+  DFEsmStateValue srcFromWrQ;
+
+  // incoming write data state
+  DFEsmStateValue wrDataPktCtr;
+
+    //TODO: should track burst numbers so to be sure to save the correct burst
+    //for now, we assume that burst data will pass through before the next burst
+    //request arrives 
+    //DFEsmStateValue   saveNxtBrst;
+    /*
+    DFEsmFifo wrDataQ;
+    DFEsmFifo wrReqQ;
+    */
+
+  public PropModSM(DFEManager owner) {
+    super(owner);
+
+    reqAddrType = dfeUInt(28);
+    reqSizeType = dfeUInt(8);
+    reqCtrlType = dfeUInt(1);
+    pktType     = dfeUInt(GC.PKTWIDTH);
+    int32Type   = dfeUInt(32);
+
+    rdReq = io.pushInput("rdReq", dfeUInt(GC.memReqWidth), 1);
+    rdReqOut = io.pushOutput("rdReqOut", dfeUInt(GC.memReqWidth), 1);
+      //rdReqAddr = io.pushInput("rdReqAddr", reqAddrType, 1);
+      //rdReqSize = io.pushInput("rdReqSize", reqSizeType, 1);
+      //rdReqCtrl = io.pushInput("rdReqCtrl", reqCtrlType, 1);
+      //rdReqAddrOut = io.pushOutput("rdReqAddrOut", reqAddrType , 1);
+      //rdReqSizeOut = io.pushOutput("rdReqSizeOut", reqSizeType , 1);
+      //rdReqCtrlOut = io.pushOutput("rdReqCtrlOut", reqCtrlType , 1);
+    wrReq = io.pushInput("wrReq", dfeUInt(GC.memReqWidth), 1);
+    wrReqOut = io.pushOutput("wrReqOut", dfeUInt(GC.memReqWidth), 1);
+      //wrReqAddr = io.pushInput("wrReqAddr", reqAddrType, 1);
+      //wrReqSize = io.pushInput("wrReqSize", reqSizeType, 1);
+      //wrReqCtrl = io.pushInput("wrReqCtrl", reqCtrlType, 1);
+      //wrReqAddrOut = io.pushOutput("wrReqAddrOut", reqAddrType , 1);
+      //wrReqSizeOut = io.pushOutput("wrReqSizeOut", reqSizeType , 1);
+      //wrReqCtrlOut = io.pushOutput("wrReqCtrlOut", reqCtrlType , 1);
+
+    rdDataIn  = io.pullInput("rdDataIn" , pktType);
+    rdDataOut = io.pullOutput("rdDataOut", pktType);
+    wrDataIn  = io.pushInput("wrDataIn", pktType, 1);
+    wrDataOut = io.pushOutput("wrDataOut", pktType, 1);
+
+    // need to use LUTs for write coalescing -- cannot use fifo RAM
+    //wrQRdPtr = state.value(dfeUInt(wrQPtrWidth), 0);
+    wrQWrPtr = state.value(dfeUInt(wrQPtrWidth), 0);
+    wrQData   = new DFEsmStateValue[wrDataQDepth];
+    //wrQOrqIdx = new DFEsmStateValue[numWrReqs];
+    wrQVal    = new DFEsmStateValue[numWrReqs];
+    for (int i = 0; i < wrDataQDepth; i++) {
+      wrQData[i]   = state.value(pktType, 0);
+    }
+    for (int i = 0; i < numWrReqs; i++) {
+      wrQVal[i]    = state.value(dfeBool(), false);
+      //wrQOrqIdx[i] = state.value(dfeUInt(orqPtrWidth), 0);
+    }
+
+
+    orqRdPtr = state.value(dfeUInt(orqPtrWidth), 0);
+    orqWrPtr = state.value(dfeUInt(orqPtrWidth), 0);
+    orqAddr    = new DFEsmStateValue[orqDepth]; //burst address
+    orqInv     = new DFEsmStateValue[orqDepth]; //invalidated (overwritten by write)
+    orqVal     = new DFEsmStateValue[orqDepth]; //valid
+    orqWrQIdx  = new DFEsmStateValue[orqDepth]; //write queue index
+    for (int i = 0; i < orqDepth; i++) {
+      orqAddr[i]   = state.value(reqAddrType, 0);
+      orqInv[i]    = state.value(dfeBool(), false);
+      orqVal[i]    = state.value(dfeBool(), false);
+      orqWrQIdx[i] = state.value(dfeUInt(wrQPtrWidth), 0);
+    }
+    
+      /*
+      Buffer.DFEsmFifoConfig wrQCfg = new Buffer.DFEsmFifoConfig();
+      wrQCfg.setIsFirstWordFallThrough();
+      wrDataQ = buffer.fifo(pktType, wrDataQDepth, wrQCfg);
+      wrReqQ  = buffer.fifo(reqAddrType, numWrReqs, wrQCfg);
+      */
+    
+
+    int rdBufDepth = GC.PKTSPERBRST*256;
+      //Buffer.DFEsmFifoConfig rdBufCfg = new Buffer.DFEsmFifoConfig();
+      //rdBufCfg.setProgrammableFull(rdBufDepth/4*3);
+      //rdBuf = buffer.fifo(pktType, rdBufDepth, rdBufCfg);
+    rdBuf = buffer.fifo(pktType, rdBufDepth);
+    rdDataInVal = state.value(dfeBool(), false);
+    rdDataPktCtr = state.value(dfeUInt(wrDataQPtrWidth), 0);
+
+    wrQIdx = state.value(dfeUInt(wrQPtrWidth), 0);
+    srcFromWrQ = state.value(dfeBool(), false);
+
+    wrDataPktCtr = state.value(dfeUInt(8), 0);
+    
+    dbgCnt = state.value(int32Type, 0);
+  }
+
+
+
+
+  @Override
+  protected void nextState() {
+    dbgCnt.next <== dbgCnt+1;
+    rdBuf.input.dataIn <== constant.value(pktType, 0);
+    rdBuf.input.writeEnable <== constant.value(false);
+    rdBuf.output.readEnable <== rdDataOut.read;
+    for (int i = 0; i < orqDepth; i++) {
+      orqAddr[i].next <== orqAddr[i];
+      orqInv[i].next  <== orqInv[i];
+      orqVal[i].next  <== orqVal[i];
+      orqWrQIdx[i].next <== orqWrQIdx[i];
+    }
+    orqRdPtr.next <== orqRdPtr;
+    orqWrPtr.next <== orqWrPtr;
+    for (int j = 0; j < wrDataQDepth; j++) wrQData[j].next <== wrQData[j];
+    for (int j = 0; j < numWrReqs; j++) wrQVal[j].next <== wrQVal[j];
+    //wrQRdPtr.next <== wrQRdPtr;
+    wrQWrPtr.next <== wrQWrPtr;
+    rdDataInVal.next <== rdDataInVal;
+    rdDataPktCtr.next <== rdDataPktCtr;
+    wrQIdx.next <== wrQIdx;
+    srcFromWrQ.next <== srcFromWrQ;
+    wrDataPktCtr.next <== wrDataPktCtr;
+    //wrDataQ.input.dataIn <== constant.value(pktType, 0);
+    //wrDataQ.input.writeEnable <== constant.value(false);
+    //wrReqQ.input.dataIn <== constant.value(reqAddrType, 0);
+    //wrReqQ.input.writeEnable <== constant.value(false);
+
+    printDebug();
+
+    DFEsmValue rdReqAddr = rdReq[GC.brstNbits:1];
+    DFEsmValue rdReqCtrl = rdReq[0];
+    DFEsmValue wrReqAddr = wrReq[GC.brstNbits:1];
+    DFEsmValue wrReqCtrl = wrReq[0];
+
+    // Incoming read request
+    IF (rdReq.valid & rdReqCtrl) {
+      orqWrPtr.next <== orqWrPtr+1;  // increment the queue write pointer
+      for (int i = 0; i < orqDepth; i++) {
+        IF (orqWrPtr.eq(i)) {
+          orqAddr[i].next <== rdReqAddr; //write values into the queue
+          orqVal [i].next <== constant.value(true);
+          orqInv [i].next <== constant.value(false);
+        }
+      }
+    }
+    
+
+    // Incoming write request
+    IF (wrReq.valid & wrReqCtrl) {  //req valid
+      for (int i = 0; i < orqDepth; i++) {  // check all outstanding reads
+        IF (wrReqAddr.eq(orqAddr[i]) & orqVal[i]) {   // if conflict, write to outstanding read entry
+          orqInv[i].next <== constant.value(true); // mark ORQ entry as invalidated
+          orqWrQIdx[i].next <== wrQWrPtr;   // mark the wrQ idx to check for data
+
+          wrQWrPtr.next <== wrQWrPtr+1;
+
+          //Try to write to wrQ (nested loops not synthesizable?)
+          for (int j = 0; j < numWrReqs; j++) {
+            IF (wrQWrPtr.eq(j)) {
+              wrQVal[j].next <== constant.value(true);
+              IF (wrDataIn.valid) {  // in case request and data come simultaneously
+                wrQData[j].next <== wrDataIn;
+                IF (wrDataPktCtr.eq(GC.PKTSPERBRST-1)) {
+                  wrDataPktCtr.next <== 0;
+                } ELSE {
+                  wrDataPktCtr.next <== wrDataPktCtr+1;
+                }
+              }
+            }
+          }
+
+        }
+      }
+    }
+
+//Still does not handle the following:
+// Release wrQ entry after all outstanding reads have used it (keep ctr)
+// New write that overwrites a previous write -- need to merge
+// New read to same address --> Log the conflict
+
+    // Incoming read data (read response)
+    rdDataInVal.next <== (~rdDataIn.empty);
+    IF (rdDataInVal) {
+      rdBuf.input.writeEnable <== constant.value(true);
+      // Fill outgoing buffer with either DRAM data or wrQ data
+      IF (rdDataPktCtr.eq(0)) { //first pkt
+        for (int i = 0; i < orqDepth; i++) {
+          IF (orqRdPtr.eq(i)) {
+            IF (orqInv[i]) {  // if head of rd req buffer was overwritten
+              srcFromWrQ.next <== constant.value(true);
+              wrQIdx.next <== orqWrQIdx[i];
+              for (int j = 0; j < numWrReqs; j++) {
+                int wrDataIdx = j*GC.PKTSPERBRST;
+                IF (orqWrQIdx[i].eq(j)) {
+                  rdBuf.input.dataIn <== wrQData[wrDataIdx];
+                }
+              }
+            } ELSE {
+              srcFromWrQ.next <== constant.value(false);
+              rdBuf.input.dataIn <== rdDataIn;
+            }
+          }
+        }
+      } ELSE { // subsequent pkts after first pkt
+        IF (srcFromWrQ) {
+          for (int j = 0; j < wrDataQDepth; j++) {
+            DFEsmValue wrDataIdx = wrQIdx.cast(dfeUInt(wrDataQPtrWidth))*GC.PKTSPERBRST;
+            IF ((rdDataPktCtr+wrDataIdx).eq(j)) {
+              rdBuf.input.dataIn <== wrQData[j];
+            }
+          }
+        } ELSE {
+          rdBuf.input.dataIn <== rdDataIn;
+        }
+      }
+
+      // Update pkt counter and/or read pointer
+      IF (rdDataPktCtr.eq(GC.PKTSPERBRST-1)) { //last pkt in burst
+        rdDataPktCtr.next <== 0;       // reset counter
+        orqRdPtr.next <== orqRdPtr+1;  //increment Rd ptr in ORQ
+        for (int i = 0; i < orqDepth; i++) {
+          IF (orqRdPtr.eq(i)) { //set ORQ entry as no longer used if done with brst
+            orqVal[i].next <== constant.value(false);
+            orqInv[i].next <== constant.value(false);
+          }
+        }
+      } ELSE {
+        rdDataPktCtr.next <== rdDataPktCtr+1;
+      }
+    }
+
+
+    // Incoming write data
+    IF (wrDataIn.valid) {
+      // increment wr data pkt ctr
+      IF (wrDataPktCtr.eq(GC.PKTSPERBRST-1)) {
+        wrDataPktCtr.next <== 0;
+      } ELSE {
+        wrDataPktCtr.next <== wrDataPktCtr+1;
+      }
+
+      // check for conflict and write to wrQ if found
+      for (int i = 0; i < numWrReqs; i++) {
+        int wrDataIdx = i*GC.PKTSPERBRST;
+        IF (wrQVal[i] & wrQWrPtr.eq(i)) { //if a conflict has been detected previously
+          IF (wrDataPktCtr.eq(0)) { //first pkt of a conflicting brst
+            wrQData[wrDataIdx].next <== wrDataIn;
+          } ELSE { //if in the middle of writing a conflicting burst
+            for (int j = 0; j < wrDataQDepth; j++) {
+              IF ((wrDataPktCtr+wrDataIdx).eq(j)) {
+                wrQData[j].next <== wrDataIn;
+              }
+            }
+          }
+        }
+      }
+    }
+    
+  }
+
+  @Override
+  protected void outputFunction() {
+    
+    // Push Outputs: rd and wr requests passed through to MemUnits
+    //rdReqCtrlOut <== rdReq[0];
+    //rdReqAdrdOut <== rdReq[GC.brstNbits:1];
+    //rdReqSizeOut <== rdReq[GC.brstNbits+GC.sizeBits : GC.brstNbits+1];
+      //rdReqAddrOut <== rdReqAddr;
+      //rdReqSizeOut <== rdReqSize;
+      //rdReqCtrlOut <== rdReqCtrl;
+      //rdReqAddrOut.valid <== rdReqAddr.valid;
+      //rdReqSizeOut.valid <== rdReqSize.valid;
+      //rdReqCtrlOut.valid <== rdReqCtrl.valid;
+    rdReqOut       <== rdReq;
+    rdReqOut.valid <== rdReq.valid;
+      //wrReqAddrOut <== wrReqAddr;
+      //wrReqSizeOut <== wrReqSize;
+      //wrReqCtrlOut <== wrReqCtrl;
+      //wrReqAddrOut.valid <== wrReqAddr.valid;
+      //wrReqSizeOut.valid <== wrReqSize.valid;
+      //wrReqCtrlOut.valid <== wrReqCtrl.valid;
+    wrReqOut       <== wrReq;
+    wrReqOut.valid <== wrReq.valid;
+
+    // PullInput from DRAM
+    rdDataIn.read <== ~rdDataIn.empty & ~rdBuf.input.full;
+
+    // PullOutput to client
+    rdDataOut.empty   <== rdBuf.output.empty;
+    rdDataOut <== rdBuf.output.dataOut;
+
+    // PushOutput
+    wrDataOut.valid <== wrDataIn.valid;
+    wrDataOut <== wrDataIn;
+  }
+
+  private void printDebug() {
+    debug.printf("[PropMod] cnt=%d, orqRdPtr=%d, orqWrPtr=%d, wrQWrPtr=%d, srcFromWrQ=%d\n",
+      dbgCnt, orqRdPtr, orqWrPtr, wrQWrPtr, srcFromWrQ);
+    debug.printf("    rd.ctrl=%d,rd.addr=%d,rd.size=%d\n", 
+      rdReq[0], rdReq[28:1], rdReq[36:29]);
+    debug.printf("    wr.ctrl=%d,wr.addr=%d,wr.size=%d\n", 
+      wrReq[0], wrReq[28:1], wrReq[36:29]);
+    debug.printf("    rdDataInVal=%d, rdDataPktCtr=%d, rdData[0]=%d\n",
+      rdDataInVal, rdDataPktCtr, rdDataIn[23:0]);
+    debug.printf("    rdBuf.we=%d, rdBuf.re=%d, rdBuf.full(3/4)=%d, rdBuf.empty=%d\n",
+      rdBuf.input.writeEnable, rdBuf.output.readEnable, rdBuf.input.full, rdBuf.output.empty);
+    debug.printf("    wrDataInVal=%d, wrDataPktCtr=%d, wrData[0]=%d\n",
+      wrDataIn.valid, wrDataPktCtr, wrDataIn[23:0]);
+  }
+}
+

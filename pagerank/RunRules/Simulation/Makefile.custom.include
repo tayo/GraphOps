@@ -1,0 +1,4 @@
+# This text will be included verbatim in the build process.
+# It has to be valid Makefile syntax.
+# Set USE_SLIC=1 if your CPUCode uses the SLiC interface.
+USE_SLIC:=1

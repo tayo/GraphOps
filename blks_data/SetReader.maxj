@@ -1,0 +1,393 @@
+package bfs_rep_u.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.SMIO;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.WrapMode;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Stream.OffsetExpr;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.IO.*;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Bitops;
+import bfs_rep_u.GC;
+import bfs_rep_u.blocks.*;
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+
+/*
+ * BVCReader: Reads from the frontier set and sends values to NodeReader for
+ * processing
+ */
+
+public class BVCReader extends Kernel {
+
+  // return value is select control of mux
+  private DFEVar prArb(int width, DFEVar req, DFEVar base) {
+    DFEVar doubleReq = (req # req).cast(dfeUInt(2*width));
+    DFEVar diff = doubleReq - base.cast(dfeUInt(2*width));
+    DFEVar doubleGrant = doubleReq & ~diff;
+    DFEVar grant = doubleGrant.slice(0, width) | doubleGrant.slice(width, width);
+    return grant; // return value can be RawBits, so no need to cast
+    //return grant.cast(dfeUInt(width));
+  }
+
+  private void printArray(DFEVar ctrl, DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf(ctrl, "%x ", ar[size-1-i]); 
+    }
+  }
+
+  public BVCReader(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(64);
+    // Scalar Inputs
+    DFEVar BV_Addr    = io.scalarInput("BV_Addr"  , dfeUInt(GC.scalWidth));
+    DFEVar nbrSetsCnt = io.scalarInput("nsCnt"    , dfeUInt(GC.scalWidth));
+    DFEVar curLvl     = io.scalarInput("curLvl"   , dfeUInt(GC.scalWidth));
+    DFEVar init       = io.scalarInput("Init"     , dfeUInt(GC.scalWidth));
+    DFEVar startCnt   = io.scalarInput("StartCnt" , dfeUInt(64));
+    DFEVar throtMax   = io.scalarInput("throtMax" , dfeUInt(32));
+    // Scalar Inputs: for debug
+    //DFEVar curLvlObs = io.scalarInput("curLvlObs", dfeUInt(GC.PROPWIDTH));
+    //DFEVar freeze   = io.scalarInput("freeze", dfeBool());
+
+    // Types
+    int arSize = GC.NBRSETSPERPKT;
+    DFEType nbrSetsType = dfeUInt(GC.NBRSETSWIDTH);
+    DFEArrayType<DFEVar> arrayType = 
+      new DFEArrayType<DFEVar>(nbrSetsType, arSize);
+    DFEType nodeType = dfeUInt(GC.nodeWidth);
+
+    // Inputs from memory (frontier elements)
+    NonBlockingInput<DFEArray<DFEVar>> bvcArray = io.nonBlockingInput("bvcArray", arrayType, constant.var(true), 
+                       1, DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar bvcArrayCtrl = bvcArray.valid;
+
+    // Latch the number of frontier elements at start of execution
+    DFEType nbrSetsCntType = dfeUInt(GC.nbrSetsCntBits);
+    DFEVar numElems = Reductions.streamHold(
+      nbrSetsCnt.slice(0, GC.nbrSetsCntBits).cast(nbrSetsCntType),
+      cnt.eq(startCnt),
+      nbrSetsCntType.encodeConstant(0));
+
+    // Feedback stall input from reader kernel
+    NonBlockingInput<DFEVar> outputStall_In =
+      io.nonBlockingInput("outputStall", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar outputStall = Reductions.streamHold(outputStall_In.data, outputStall_In.valid,
+                                               dfeBool().encodeConstant(false));
+
+    NonBlockingInput<DFEVar> endSignal_In =
+      io.nonBlockingInput("endSignal", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar endSignal  = endSignal_In.valid ? endSignal_In.data : constant.var(false);
+
+    int endBrstWidth = GC.nbrSetsCntBits - GC.nsPBBits;
+    DFEVar endBrst = numElems.slice(GC.nsPBBits, endBrstWidth).cast(dfeUInt(endBrstWidth));
+    DFEVar endPkt  = numElems.slice(GC.nsPPBits, GC.pktsPBBits).cast(dfeUInt(GC.pktsPBBits));
+
+    // Counter to track number of packets
+    Count.Params pktCntParams = control.count.makeParams(GC.pktsPBBits)
+        .withEnable(bvcArrayCtrl);
+    Counter pktCounter = control.count.makeCounter(pktCntParams);
+    DFEVar pktCnt = pktCounter.getCount();
+    // Counter tracking number of bursts arrived
+    int brstCntbits = endBrstWidth;
+    Count.Params brstCntParams = control.count.makeParams(brstCntbits)
+        .withEnable(pktCounter.getWrap());
+    DFEVar brstCnt = (control.count.makeCounter(brstCntParams)).getCount();
+
+    // Use counter to generate windows to observe different sections of the bit-vector
+    //@@ -- Needs to be changed if the GC.PROPWIDTH is changed!
+    int muxWidth = 32; //GC.PROPPERBRST
+    int numWin = GC.PROPPERBRST/muxWidth;  //64 propsPerBurst ==> 2 windows
+    int numWinBits = MathUtils.bitsToAddress(numWin);
+    Count.Params nbrSetWinCntParams = control.count.makeParams(numWinBits)
+        .withEnable(constant.var(true));
+    Counter nbrSetWinCounter = control.count.makeCounter(nbrSetWinCntParams);
+    DFEVar numWinCnt = nbrSetWinCounter.getCount();
+    //throttle emitting of nbrSets.  Expansion requires multiple cycles per set
+    DFEVar emitNbrSet = numWinCnt.eq(0) & ~outputStall; 
+
+    // Removed generation of bvMode (used to select between BV_C and BV_N)
+
+    ////////////////////////////////////////////////////
+    // NbrSet FIFOs
+    SMIO [] nbrSetFifo = new SMIO[arSize];
+    DFEVar[] pktMask = new DFEVar[arSize];
+    DFEVar[] lastPktVal = new DFEVar[arSize];
+    DFEVar numElemsIdx = numElems.slice(0, GC.nsPPBits).cast(dfeUInt(GC.nsPPBits));
+    DFEVar goodBrst = brstCnt <= endBrst;
+    DFEVar goodPkt  = bvcArrayCtrl & ((brstCnt < endBrst)|(pktCnt <= endPkt));
+    DFEVar lastPkt  = bvcArrayCtrl & brstCnt.eq(endBrst) & pktCnt.eq(endPkt);
+    DFEVar notLastPkt = goodBrst & goodPkt & ~lastPkt;
+
+    OffsetExpr nbrSetLoopLen = stream.makeOffsetAutoLoop("nbrSetLoopLen");
+    DFEVar nbrSetRdEn = dfeRawBits(arSize).newInstance(this);
+    DFEVar[] nbrSetOutputs = new DFEVar[arSize];
+    DFEArrayType<DFEVar> nbrSetBoolArray = new DFEArrayType<DFEVar>(dfeBool(), arSize);
+    DFEArray<DFEVar> nbrSetAvail = nbrSetBoolArray.newInstance(this);
+    DFEVar nbrSetToProc = nbrSetsType.newInstance(this);
+
+    int nbrSetFifoWidth = GC.NBRSETSWIDTH;
+    int nbrSetFifoDepth = GC.bvcFifoDepth; //HW --> smaller due to throttling?
+    for (int i = 0; i < arSize; i++) {
+      lastPktVal[i] = lastPkt & (i < numElemsIdx);
+      pktMask[i] = notLastPkt | lastPktVal[i];
+      // FIFOs to store frontier read from memory
+      nbrSetFifo[i] = addStateMachine("nbrSetFifo"+i,
+                                  new FifoKernelSM(this, nbrSetFifoWidth, nbrSetFifoDepth));
+      nbrSetFifo[i].connectInput("dataIn", bvcArray.data[i]);
+      nbrSetFifo[i].connectInput("dataVal", pktMask[i]);
+      // only assert readEn during emitNbrSet cycle -- throttles emitting of
+      // nbrset to allow time for expansion in the next set of FIFOs
+      nbrSetFifo[i].connectInput("readEn", emitNbrSet & nbrSetRdEn.slice(i).cast(dfeBool()));
+      //--nbrSetFifo[i].connectInput("readEn", emitNbrSet & nbrSetRdEn.slice(i).cast(dfeBool()));
+      nbrSetOutputs[i] = nbrSetFifo[i].getOutput("dataOut");
+      nbrSetAvail[i] <== nbrSetFifo[i].getOutput("dataRdy");
+    }
+
+    DFEVar tmpBaseCnt = control.count.simpleCounter(GC.nPPBits);
+    DFEVar arbBaseCnt = constant.var(dfeUInt(arSize), 1) << tmpBaseCnt;
+    DFEVar nbrSetArbReq = nbrSetAvail.pack();
+    nbrSetRdEn <== prArb(arSize, stream.offset(nbrSetArbReq, -nbrSetLoopLen), arbBaseCnt);
+    //--DFEVar nbrSetArbReqFixed = nbrSetArbReq.cast(dfeUInt(arSize));
+    //--nbrSetRdEn <== Bitops.leading1Detect(stream.offset(nbrSetArbReqFixed, -nbrSetLoopLen)); 
+
+    nbrSetToProc <== control.oneHotMux(nbrSetRdEn, nbrSetOutputs);
+    DFEVar muxValid = (nbrSetArbReq & nbrSetRdEn).cast(dfeUInt(arSize)) > 0;
+    //--nbrSetToProc <== control.oneHotMux(nbrSetRdEn, nbrSetOutputs);
+    //--DFEVar muxValid = (nbrSetArbReq & nbrSetRdEn).cast(dfeUInt(arSize)) > 0;
+    DFEVar procNbrSet = muxValid & emitNbrSet;
+    ////////////////////////////////////////////////////
+
+    // Register nbr set to proc (requires multiple cycles for the windows)
+    DFEVar nbrSet = Reductions.streamHold(nbrSetToProc, procNbrSet,
+                                          dfeUInt(GC.NBRSETSWIDTH).encodeConstant(0));
+    // need procNbrSet to be asserted for <numWindows> cycles: in this case 2
+    //@@
+    DFEVar procNbrSet2 = stream.offset(procNbrSet, -1); 
+    DFEVar expand = procNbrSet | procNbrSet2;
+
+
+      //code for nodewidth > baseAddrWidth
+      //int bufNode = GC.NODEWIDTH - baseAddrWidth - GC.pPBBits;
+      //DFEVar baseNodeRaw = constant.var(dfeRawBits(bufNode), 0) # 
+      //                     baseNodeAddr #
+      //                     constant.var(dfeRawBits(GC.pPBBits), 0);
+
+    ////////////////////////////////////////////////////
+    // nbrset Expansion FIFOs: place set of neighbors
+    int baseAddrWidth = GC.NBRSETSWIDTH - GC.PROPPERBRST;
+    DFEVar baseNodeAddr = nbrSet.slice(GC.PROPPERBRST, baseAddrWidth);
+    //code for baseAddrWidth > nodewidth
+    int bufNode = GC.nodeWidth-GC.pPBBits;
+    DFEVar baseNodeRaw = baseNodeAddr.slice(0, bufNode) #
+                         constant.var(dfeRawBits(GC.pPBBits), 0);
+    DFEVar baseNode = baseNodeRaw.cast(nodeType);
+    DFEVar bitVec   = nbrSet.slice(0, GC.PROPPERBRST);
+    SMIO [] bvFifo = new SMIO[muxWidth];
+
+    OffsetExpr bvElemLoopLen = stream.makeOffsetAutoLoop("bvElemLoopLen");
+    //--DFEVar bvElemRdEn = dfeUInt(muxWidth).newInstance(this);
+    DFEVar bvElemRdEn = dfeRawBits(muxWidth).newInstance(this);
+    //##DFEArrayType<DFEVar> bvElemArray = new DFEArrayType<DFEVar>(nodeType, muxWidth);
+    //##DFEArray<DFEVar> bvElemOutputs = bvElemArray.newInstance(this);
+    DFEVar[] bvElemOutputs = new DFEVar[muxWidth];
+    DFEArrayType<DFEVar> bvElemBoolArray = new DFEArrayType<DFEVar>(dfeBool(), muxWidth);
+    DFEArray<DFEVar> bvElemAvail = bvElemBoolArray.newInstance(this);
+    DFEVar nodeToProc = nodeType.newInstance(this);
+
+    // throttle emission of nbrs: relieve pressure on the memory controller
+    Count.Params throtCntParams = control.count.makeParams(32)
+        .withEnable(constant.var(true))
+        .withMax(throtMax)
+        .withWrapMode(WrapMode.COUNT_LT_MAX_THEN_WRAP);
+    // use wrap signal to determine when valid to read from fifo and send node
+    Counter throtCounter = control.count.makeCounter(throtCntParams);
+
+    DFEVar emitNode   = ~outputStall & throtCounter.getWrap();
+
+    int bvFifoWidth = GC.nodeWidth;
+    int bvFifoDepth = GC.bvcFifoDepth;  //HW
+    for (int i = 0; i < muxWidth; i++) {
+
+      //@@ hard-coded as exactly 2 windows. could extend to more
+      DFEVar dataIn  = (numWinCnt.eq(0)) ? baseNode+i 
+                                         : baseNode + (muxWidth+i);
+      DFEVar dataVal = (numWinCnt.eq(0)) ? expand & bitVec.slice(i).cast(dfeBool())
+                                         : expand & bitVec.slice(muxWidth+i).cast(dfeBool());
+
+      bvFifo[i] = addStateMachine("bvFifo"+i,
+                                  new FifoKernelSM(this, bvFifoWidth, bvFifoDepth));
+      bvFifo[i].connectInput("dataIn", dataIn);
+      bvFifo[i].connectInput("dataVal", dataVal);
+      bvFifo[i].connectInput("readEn", emitNode & bvElemRdEn.slice(i).cast(dfeBool()));
+      bvElemOutputs[i] = bvFifo[i].getOutput("dataOut");
+      bvElemAvail[i]   <== bvFifo[i].getOutput("dataRdy");
+    }
+    //debug.printf("\n");
+
+    DFEVar bvTmpBaseCnt = control.count.simpleCounter(GC.pPPBits);
+    DFEVar bvArbBaseCnt = constant.var(dfeUInt(GC.PROPPERPKT), 1) << bvTmpBaseCnt;
+    DFEVar bvElemArbReq = bvElemAvail.pack();
+    //--DFEVar bvElemArbReqFixed = bvElemArbReq.cast(dfeUInt(muxWidth));
+    //--bvElemRdEn <== Bitops.leading1Detect(stream.offset(bvElemArbReqFixed, -bvElemLoopLen)); 
+    bvElemRdEn <== prArb(muxWidth, stream.offset(bvElemArbReq, -bvElemLoopLen), 
+                         bvArbBaseCnt);
+
+    //##nodeToProc <== control.oneHotMux(bvElemRdEn, bvElemOutputs.elementsAsList());
+    //nodeToProc <== control.oneHotMux(bvElemRdEn, bvElemOutputs); //my standard method
+
+    //attempting to use work-around that does not involve oneHotMux
+    nodeToProc <== control.mux(Bitops.onehotDecode(bvElemRdEn), bvElemOutputs);
+    DFEVar nodeMuxValid = (bvElemArbReq & bvElemRdEn).cast(dfeUInt(muxWidth)).neq(0);
+    DFEVar sendNode = nodeMuxValid & emitNode;
+
+    ////////////////////////////////////////////////////
+    // Count number of nbrSets emitted from nbrSet fifos
+    Count.Params nsProcdCntParams = control.count.makeParams(GC.nbrSetsCntBits)
+        .withEnable(procNbrSet);
+    DFEVar nsProcd = (control.count.makeCounter(nsProcdCntParams)).getCount();
+
+    // Scheme: request N (or brstInc) bursts at a time.  req_en asserted if
+    // current brstCnt is on the (N-1)st of the N bursts and numElems is greater
+    // than the end of the Nth burst
+    // Throttling: Use the nsProcd (requested) and rec'd (elemsSoFar) to
+    // determine whether to pause requesting (prevent the FIFOs from overflowing
+    // for large data sets)
+    // elemsSoFar:  number of data that have entered the kernel
+    int threshHi = GC.threshHi;  //hysteresis: if ouststanding elems are > threshHi, then stall
+    int threshLo = GC.threshLo;  //  if num elems in fifos drop below threshLo, then start again
+
+    int brstInc = GC.brstInc; // brst grp size to request at once
+    int brstIncBits = MathUtils.bitsToAddress(brstInc);
+    DFEVar elemsSoFar = (brstCnt << GC.nsPBBits).cast(nbrSetsCntType);
+      //throttling
+      DFEVar numDataInFifos = elemsSoFar - nsProcd;
+      OffsetExpr stallLoopLen = stream.makeOffsetAutoLoop("stallLoopLen");
+      DFEVar stall = dfeBool().newInstance(this);
+      DFEVar beginStall = ~stall & (elemsSoFar>nsProcd) & (numDataInFifos > threshHi);
+      DFEVar endStall = stall & (numDataInFifos < threshLo);
+      DFEVar stallReg = Reductions.streamHold(beginStall, beginStall|endStall,
+                                              dfeBool().encodeConstant(false));
+      stall <== stream.offset(stallReg, -stallLoopLen);
+      DFEVar stallPrev = stream.offset(stall, -1);
+      DFEVar doneStall = stallPrev & ~stall;
+    DFEVar brstNumInGrp = brstCnt.slice(0,brstIncBits).cast(dfeUInt(brstIncBits));
+    DFEVar almostDone = brstNumInGrp.eq(brstInc-1); //last brst in grp
+    DFEVar moreToRd = numElems > (elemsSoFar + GC.NBRSETSPERBRST);
+    DFEVar reqMore = (~stall & almostDone & moreToRd & (bvcArrayCtrl & pktCnt.eq(0))) |
+                     (doneStall & moreToRd);
+
+    /*
+    //Debug
+    // Freeze execution: Don't issue request for boundary vectors
+    //DFEVar freezeNext = freeze & (curLvlCnt >= curLvlObs-1);
+    */
+
+    // Starting condition:
+    // if init, then NbrPropRdr will be starting the execution, so do nothing
+    // else, start when the timer equals startCnt
+    DFEVar reqStart = (init>0) ? constant.var(false) : cnt.eq(startCnt);
+    //DFEVar reqStart = BVNdone & (nbrSetsCnt > 0); // & ~freezeNext;
+
+    // Outputs to NodeReader
+    io.output("ndNum", nodeToProc, nodeType, sendNode);
+
+    // curLvl outputs to updating units: prop filter and lvlUpd
+    DFEVar curLvlProp = curLvl.slice(0, GC.PROPWIDTH).cast(dfeUInt(GC.PROPWIDTH));
+    DFEVar sendCurLvl = (cnt & constant.var(dfeUInt(64), 15)).eq(0); //every 16 cycles
+    io.output("curLvl0", curLvlProp, dfeUInt(GC.PROPWIDTH), sendCurLvl);
+    io.output("curLvl1", curLvlProp, dfeUInt(GC.PROPWIDTH), sendCurLvl);
+
+      //io.output("bvcRdrDone", BVCdone, dfeBool(), BVCdone);
+    // Outputs to MemUnit
+    DFEType reqAddrType = dfeUInt(GC.brstNbits);
+    DFEType reqSizeType = dfeUInt(GC.sizeBits);
+    DFEVar baseAddr = BV_Addr.cast(reqAddrType); // removed BVC/BVN
+      //optimization.pushPipeliningFactor(0);
+      //DFEVar endSignal = BVNdone & (bvCnt.eq(0));
+        //DFEVar endSignal = (BVNdone & (bvCnt.eq(0))) | cnt.eq(200);
+      //optimization.popPipeliningFactor();
+    DFEVar req_brst_addr = ~endSignal 
+                        ? baseAddr + 
+                          brstCnt.cast(reqAddrType) + 
+                          almostDone.cast(reqAddrType) //request 1 ahead (almostDone)
+                        : constant.var(reqAddrType, 1<<27);
+    DFEVar req_size = ~endSignal ? constant.var(reqSizeType, brstInc) :
+                          constant.var(reqSizeType, 1);
+    DFEVar req_en = reqStart | reqMore | endSignal;
+    //<debug>DFEVar req_en = ((reqStart | reqMore) & ~freezeNext) | endSignal;
+    io.output("memReq", req_size#req_brst_addr#req_en, dfeRawBits(GC.memReqWidth));
+
+    /*
+    /////////////////////////////////////////
+    // Debug -- Scalar Outputs
+    //DFEVar recdBVNdone = Reductions.streamHold(BVNdone, BVNdone,
+    //                                           dfeBool().encodeConstant(false));
+    DFEVar nbrSetsAtDone = Reductions.streamHold(nbrSetsCnt, BVNdone,
+                                                 dfeUInt(16).encodeConstant(0));
+    DFEVar thisIter = curLvlCnt.eq(curLvlObs);
+      //nbrSetsProcessedCounter
+      Count.Params nSPCParams = control.count.makeParams(32)
+        .withEnable(thisIter & procNbrSet);
+      Counter nSPCounter = control.count.makeCounter(nSPCParams);
+      DFEVar nSPCnt = nSPCounter.getCount();
+    DFEVar nbrSetsProc = Reductions.streamHold(nSPCnt, thisIter,
+                                               dfeUInt(32).encodeConstant(0));
+      //nodesProcessedCounter
+      Count.Params nPCParams = control.count.makeParams(32)
+        .withEnable(thisIter & sendNode);
+      Counter nPCounter = control.count.makeCounter(nPCParams);
+      DFEVar nPCnt = nPCounter.getCount();
+    DFEVar nodesProc = Reductions.streamHold(nPCnt, thisIter,
+                                             dfeUInt(32).encodeConstant(0));
+    DFEVar curLvlAtAr = Reductions.streamHold(curLvlCnt, bvcArrayCtrl, //progress
+                                      dfeUInt(GC.PROPWIDTH).encodeConstant(0));
+    // these are useless--interrupt request is sent
+    //DFEVar rdReqSent = Reductions.streamHold(req_en, req_en,  
+    //                                         dfeBool().encodeConstant(false));
+    //DFEVar recdBVCAr = Reductions.streamHold(bvcArrayCtrl, bvcArrayCtrl,
+    //                                         dfeBool().encodeConstant(false));
+    //io.scalarOutput("scalarOut_0", recdBVNdone, dfeBool());
+    io.scalarOutput("scalarOut_0", nbrSetsAtDone, dfeUInt(16));
+    io.scalarOutput("scalarOut_1", nbrSetsProc, dfeUInt(32));
+    io.scalarOutput("scalarOut_2", nodesProc,   dfeUInt(32));
+    io.scalarOutput("scalarOut_3", curLvlAtAr, dfeUInt(GC.PROPWIDTH));
+    //io.scalarOutput("scalarOut_2", recdBVCAr, dfeBool());
+    //io.scalarOutput("scalarOut_3", rdReqSent, dfeBool());
+    */
+
+
+    // Debug
+    debug.printf("BVCReader: cnt=%d, nbrSetsCnt=%d, numNbrSets=%d, init=%d, outputStall=%d\n", 
+      cnt, nbrSetsCnt, numElems, init, outputStall);
+    debug.printf("    arCtrl=%d, endBrst=%d, endPkt=%d, bvcAr = ", 
+      bvcArrayCtrl, endBrst, endPkt);
+    printArray(bvcArrayCtrl, bvcArray.data.elementsAsArray(), arSize); 
+    debug.printf(bvcArrayCtrl, "\n");
+    debug.printf(bvcArrayCtrl, "    pktMask = "); 
+      printArray(bvcArrayCtrl, pktMask, arSize); debug.printf("\n");
+    debug.printf("    pktCnt=%d, brstCnt=%d, goodBrst=%d, goodPkt=%d, lastPkt=%d\n",
+      pktCnt, brstCnt, goodBrst, goodPkt, lastPkt);
+    debug.printf("    nsArbReq=%o, nsRdEn=%o, nbrSetToProc=%x, nbrSet=%x\n",
+      nbrSetArbReq, nbrSetRdEn, nbrSetToProc, nbrSet);
+    debug.printf("    window=%d, procSet=%d, bvArbReq=%o, bvRdEn=%o, baseNode=%d, bitVec=%x\n",
+      numWinCnt, procNbrSet, bvElemArbReq, bvElemRdEn, baseNode, bitVec);
+    debug.printf("    throtCnt=%d, emitNode=%d, sendNode=%d, ndNum=%d, ndNumCtrl=%d, curLvl=%d, bvcDone=n/a\n",
+      throtCounter.getCount(), emitNode, sendNode, nodeToProc, sendNode, curLvl);
+    debug.printf("    stall=%d, nsProcd=%d, numDInFifos=%d, bStall=%d, eStall=%d, stallReg=%d, doneStall=%d\n",
+      stall, nsProcd, numDataInFifos, beginStall, endStall, stallReg, doneStall);
+    debug.printf("    req_brst_addr=%d, req_size=%d, req_en=%d, endSignal=%d\n",
+      req_brst_addr, req_size, req_en, endSignal);
+
+    flush.onTrigger(constant.var(false)); //run without restriction or constraint
+
+  }
+}
+

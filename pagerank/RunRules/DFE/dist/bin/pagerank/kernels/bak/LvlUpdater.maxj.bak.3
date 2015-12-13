@@ -1,0 +1,193 @@
+package graph_accel.kernels;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.SMIO;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArray;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEArrayType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.IO.*;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.Counter;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.memory.Memory;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.Reductions;
+import graph_accel.GC;
+
+public class LvlUpdater extends Kernel {
+
+  private void printArrayHex(DFEVar ctrl, DFEVar[] ar, int size) {
+    for (int i=0; i < size; i++) { 
+      debug.printf(ctrl, "%x ", ar[size-1-i]); 
+    }
+  }
+
+  public LvlUpdater(KernelParameters parameters) {
+    super(parameters);
+    DFEVar cnt = control.count.simpleCounter(64);
+    // Scalar Inputs
+    DFEVar propAddr  = io.scalarInput("propAddr", dfeUInt(GC.scalWidth));
+    DFEVar curLvlObs = io.scalarInput("curLvlObs", dfeUInt(GC.PROPWIDTH));
+    DFEVar uDVal     = io.scalarInput("uDVal"   , dfeUInt(32));
+
+    // Inputs from DRAM
+    int arSize = GC.PROPPERPKT;
+    DFEType propType = dfeInt(GC.PROPWIDTH);
+    DFEArrayType<DFEVar> arrayType = 
+      new DFEArrayType<DFEVar>(propType, arSize);
+    NonBlockingInput<DFEArray<DFEVar>> propArray_In = 
+      io.nonBlockingInput("propArray", arrayType, constant.var(true), 1,
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEArray<DFEVar> propArray = propArray_In.data;
+    DFEVar propArrayCtrl       = propArray_In.valid;
+
+    // Inputs from BVCReader
+    NonBlockingInput<DFEVar> curLvl_In =
+      io.nonBlockingInput("curLvl", propType, constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar curLvl = Reductions.streamHold(curLvl_In.data, curLvl_In.valid, 
+                                          propType.encodeConstant(0));
+
+    NonBlockingInput<DFEVar> clrDone_In =
+      io.nonBlockingInput("clrDone", dfeBool(), constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar clrDone = clrDone_In.valid ? clrDone_In.data : constant.var(false);
+
+    // Inputs from LvlReader
+    DFEType edgeType = dfeUInt(GC.EDGEWIDTH);
+    //YY-DFEType edgeType = dfeUInt(GC.ePtrWidth);
+    NonBlockingInput<DFEVar> nbrNum_Input =
+      io.nonBlockingInput("nbrNum", edgeType, constant.var(true), 1, 
+                          DelimiterMode.FRAME_LENGTH, 0, NonBlockingMode.NO_TRICKLING);
+    DFEVar nbrNum_In  = nbrNum_Input.data;
+    DFEVar nbrNumCtrl = nbrNum_Input.valid;
+
+
+    /////////////////
+    // CoalesceSM
+    /////////////////
+    SMIO coalesceSM = addStateMachine("CoalesceSM", new CoalesceSM(this));
+    coalesceSM.connectInput("nbrIn", 
+      nbrNum_In.slice(0, GC.coalesceNbrWidth).cast(dfeUInt(GC.coalesceNbrWidth)));
+    coalesceSM.connectInput("nbrInVal", nbrNumCtrl);
+    coalesceSM.connectInput("curLvl", curLvl.cast(dfeUInt(GC.PROPWIDTH)));
+    coalesceSM.connectInput("dataArrayIn",
+                            propArray.pack().cast(dfeUInt(GC.PKTWIDTH)));
+    coalesceSM.connectInput("dataArrayInVal", propArrayCtrl);
+    DFEVar updNbrsCtrl    = coalesceSM.getOutput("updNbrsCtrl");
+    DFEVar updNbrsBase    = coalesceSM.getOutput("updNbrsBase");
+    DFEVar updNbrsBitVec  = coalesceSM.getOutput("updNbrsBitVec");
+    DFEVar propArrayOut   = coalesceSM.getOutput("dataArrayOut");
+    DFEVar propArrayOutCtrl = coalesceSM.getOutput("dataArrayOutVal");
+    DFEVar brstToWrite    = coalesceSM.getOutput("reqBrstAddr");
+    DFEVar req_en         = coalesceSM.getOutput("reqEn");
+    DFEVar brstToRead     = coalesceSM.getOutput("reqBrstAddrRd");
+    DFEVar req_en_rd      = coalesceSM.getOutput("reqEnRd");
+    DFEVar emptyQ         = coalesceSM.getOutput("emptyQ");
+
+
+
+    // Output to BVNWriter
+    io.output("updNbrs", updNbrsBase # updNbrsBitVec, 
+              dfeRawBits(GC.coalesceAddrWidth + GC.PROPPERBRST), updNbrsCtrl);
+    //io.output("updNbrsBase", updNbrsBase, dfeUInt(GC.coalesceAddrWidth), updNbrsCtrl);
+    //io.output("updNbrsBitVec", updNbrsBitVec, dfeUInt(GC.PROPPERBRST), updNbrsCtrl);
+
+
+    // Determine when the kernel has finished processing for this curLvl
+    // For LvlUpd, there are 2 cases that require done packets:
+    //   a. Send some done packets before any activity duing this iteration.
+    //      This is because the last iteration will not have any data (no
+    //      modifications of graph properties).
+    //      - Be sure to send a packet if this iteration is not empty (upon nbrNumCtrl)
+    //   b. Send some done packets after this iteration's activity to tell the
+    //      receiver (BVNWriter) that this iteration has completed.
+    //      
+    //XX changes: a) add nbrNumCtrl to doneOff, b) remove nbrNumCtrl_d
+    //XX-DFEVar nbrNumCtrl_d = stream.offset(nbrNumCtrl, -1); //avoid blip with first nbrCtrl
+    //XX-DFEVar begun = Reductions.streamHold(nbrNumCtrl_d, nbrNumCtrl_d | clrDone,
+    DFEVar begun = Reductions.streamHold(nbrNumCtrl, nbrNumCtrl | clrDone,
+                                         dfeBool().encodeConstant(false));
+
+    DFEVar noActiveData = ~propArrayCtrl & ~nbrNumCtrl; //XX & ~nbrNumCtrl_d;
+    DFEVar knlDoneLast  = ~begun;  // case a: no data during last iteration
+    DFEVar knlDoneData  = begun & emptyQ & noActiveData; // case b
+    DFEVar knlDone      = knlDoneData | knlDoneLast;
+    DFEVar knlDone_d    = stream.offset(knlDone, -1); //XX-added
+    //XX-DFEVar begun_d      = stream.offset(begun, -1);
+    //XX-DFEVar doneOff      = (begun & ~begun_d) | nbrNumCtrl;
+    DFEVar doneOff      = (knlDone_d & nbrNumCtrl); //XX--(begun & ~begun_d) | nbrNumCtrl;
+    // Counter limits the number of done packets sent.  Too many packets
+    // increases buffering and latency.
+    Count.Params sendDoneParams = control.count.makeParams(32)
+      .withEnable(knlDone)
+      .withReset(clrDone|doneOff);
+    DFEVar sendDoneCnt = (control.count.makeCounter(sendDoneParams)).getCount();
+    DFEVar sendLength = uDVal*2;
+    // doneOff signal notifies the receiver that this iteration is not empty
+    DFEVar sendDone = (knlDone & (sendDoneCnt < sendLength)) | doneOff;
+
+
+    io.output("lvlUpdIdle", knlDone, dfeBool(), sendDone|clrDone); //, constant.var(true));
+
+    // Output modified propArray to DRAM:  lvl numbers -- controlled output
+    io.output("propArrayMod", propArrayOut, dfeUInt(GC.PKTWIDTH), propArrayOutCtrl);  
+    
+    // Emit write request when beginning processing of a new nbrNum
+    DFEType reqAddrType = dfeUInt(GC.brstNbits);
+    DFEType reqSizeType = dfeUInt(GC.sizeBits);
+    DFEVar propAddrBase = propAddr.cast(reqAddrType);
+    DFEVar req_brst_addr = brstToWrite+propAddrBase;
+    DFEVar req_size = constant.var(dfeUInt(GC.sizeBits), 1);
+    io.output("memReq", req_size#req_brst_addr#req_en, 
+              dfeRawBits(GC.memReqWidth));
+    // Emit read request
+    DFEVar req_brst_addr_rd = brstToRead+propAddrBase;
+    io.output("memReqRd", req_size#req_brst_addr_rd#req_en_rd,
+              dfeRawBits(GC.memReqWidth));
+
+    /////////////////////////////////////////
+    // Debug -- Scalar Outputs
+    DFEVar thisIter = curLvl.slice(0,16).eq(curLvlObs.slice(0,16));
+      //nbrCounter
+      Count.Params nCParams = control.count.makeParams(32)
+        .withEnable(thisIter & nbrNumCtrl);
+      Counter nCounter = control.count.makeCounter(nCParams);
+      DFEVar nCnt = nCounter.getCount();
+    DFEVar nbrCounter = Reductions.streamHold(nCnt, thisIter,
+                                             dfeUInt(32).encodeConstant(0));
+      //nbrSet Counter
+      Count.Params nsCParams = control.count.makeParams(32)
+        .withEnable(thisIter & updNbrsCtrl);
+      Counter nsCounter = control.count.makeCounter(nsCParams);
+      DFEVar nsCnt = nsCounter.getCount();
+    DFEVar nbrSets = Reductions.streamHold(nsCnt, thisIter,
+                                           dfeUInt(32).encodeConstant(0));
+    DFEVar emptyQAtEnd = Reductions.streamHold(emptyQ, thisIter, 
+                                               dfeBool().encodeConstant(false));
+    io.scalarOutput("scalarOut_0", nbrCounter  , dfeUInt(32));
+    io.scalarOutput("scalarOut_1", nbrSets     , dfeUInt(32));
+    io.scalarOutput("scalarOut_2", emptyQAtEnd , dfeBool());
+
+
+
+    //debug
+    debug.printf("LvlUpdater: cnt=%d, nbrNumCtrl=%d, propArrayCtrl=%d, curLvl=%d, propAddr=%d\n", 
+                 cnt, nbrNumCtrl, propArrayCtrl, curLvl, propAddr);
+    debug.printf(nbrNumCtrl, "    nbrNum_In=%d\n", nbrNum_In);
+    debug.printf(propArrayCtrl, "    propArray = ");
+      printArrayHex(propArrayCtrl, propArray.elementsAsArray(), GC.PROPPERPKT); 
+      debug.printf(propArrayCtrl, "\n");
+    debug.printf(propArrayOutCtrl, "    propArrayOut = ");
+      for (int i = GC.PROPPERPKT-1; i >= 0; i--) 
+        debug.printf(propArrayOutCtrl, "%d ", propArrayOut.slice(i*GC.PROPWIDTH, GC.PROPWIDTH));
+      debug.printf(propArrayOutCtrl, "\n");
+    debug.printf("    begun=%d [%d], emptyQ=%d, knlDone=%d, sendDone=%d (cnt=%d), clrDone=%d\n",
+                 begun, doneOff, emptyQ, knlDone, sendDone, sendDoneCnt, clrDone);
+    debug.printf("    req_en=%d, req_brst_addr=%d, upd: val=%d, base=%d, bv=%o\n",
+                 req_en, req_brst_addr, updNbrsCtrl, updNbrsBase, updNbrsBitVec);
+
+    flush.onTrigger(constant.var(false));
+  }
+
+}

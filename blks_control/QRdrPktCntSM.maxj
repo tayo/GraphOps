@@ -1,0 +1,145 @@
+/*
+ * A Kernel State Machine that handles complex control signals for LvlReader
+ * kernel.  Outputs generated are:
+ *   incRdPtr for edgePtr RAMs
+ * Includes packet counter
+ */
+
+package pagerank.kernels;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelLib;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmInput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmOutput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateValue;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateEnum;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmValue;
+import com.maxeler.maxcompiler.v2.statemachine.kernel.KernelStateMachine;
+import com.maxeler.maxcompiler.v2.statemachine.types.DFEsmValueType;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.buffer.DFEsmFifo;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.Buffer;
+
+public class QRdrPktCntSM extends KernelStateMachine {
+
+  DFEsmFifo numPktsFifo;
+
+  // I/O
+  private final DFEsmInput  iNumPktsVal;
+  private final DFEsmInput  iNumPkts;
+  private final DFEsmInput  iPktVal;
+  private final DFEsmOutput oIncRdPtr;
+  private final DFEsmOutput oPktCnt;
+  private final DFEsmOutput oStall;
+
+  // State
+  private final DFEsmStateValue dbgCnt;
+  private final DFEsmStateValue pktCounter;
+  private final DFEsmStateValue numPktsValD;
+
+  // state for asserting stall signal
+  private final int fifoDepth;
+  private final int threshHi;
+  private final int threshLo;
+  public enum States {
+    COUNTING_UP,
+    STALL
+  }
+  private final DFEsmStateEnum<States> stallState;
+
+  public QRdrPktCntSM(KernelLib owner, int cntWidth, int qDepth) {
+    super(owner);
+
+    DFEsmValueType counterType = dfeUInt(cntWidth);
+    Buffer.DFEsmFifoConfig numPktsFifoCfg = new Buffer.DFEsmFifoConfig();
+    numPktsFifoCfg.setIsFirstWordFallThrough();
+    numPktsFifoCfg.setHasDataCount();
+    numPktsFifoCfg.setHasValidFlag();
+    numPktsFifo = buffer.fifo(counterType, qDepth, numPktsFifoCfg);
+
+    // Inputs
+    iNumPktsVal  = io.input("numPktsVal", dfeBool());
+    iNumPkts     = io.input("numPkts", counterType);
+    iPktVal      = io.input("pktVal", dfeBool());
+    // Outputs
+    oIncRdPtr    = io.output("incRdPtr", dfeBool());
+    oPktCnt      = io.output("pktCnt", counterType); 
+
+    oStall       = io.output("stall", dfeBool());
+    fifoDepth    = qDepth;
+    threshHi     = 256; //(int)(0.75*fifoDepth);
+    threshLo     = 64; //(int)(0.25*fifoDepth);
+    stallState = state.enumerated(States.class, States.COUNTING_UP);
+
+    // State
+    dbgCnt     = state.value(dfeUInt(32), 0);
+    pktCounter = state.value(counterType, 0);
+    numPktsValD = state.value(dfeBool(), false);
+  }
+
+  @Override
+  protected void nextState() {
+    dbgCnt.next <== dbgCnt+1;
+    pktCounter.next <== pktCounter;
+    stallState.next <== stallState;
+
+    DFEsmValue curFifoOutput = numPktsFifo.output.dataOut;
+    DFEsmValue lastPkt = pktCounter.eq(curFifoOutput-1);
+    numPktsValD.next <== iNumPktsVal;
+
+    IF (numPktsFifo.input.full) {
+      debug.printf("  --Full-fifo QRdrPktCntSM..\n");
+    }
+
+    // Fifo inputs
+    numPktsFifo.input.dataIn <== iNumPkts;
+    numPktsFifo.input.writeEnable <== iNumPktsVal;
+    numPktsFifo.output.readEnable <== iPktVal & lastPkt;
+
+
+    // Packet Counter
+    IF (iPktVal) { // the numPktsFifo should never be empty here
+      IF (pktCounter.eq(curFifoOutput-1)) { // all pkts have been received
+        pktCounter.next <== 0;
+      } ELSE {
+        pktCounter.next <== pktCounter+1;
+      }
+    }
+
+    // Stall state machine: Use hysteresis to assert stall signal
+    // assert stall if dataCount > threshHi
+    // de-assert if dataCount < threshLo
+    SWITCH(stallState) {
+      CASE (States.COUNTING_UP) {
+        IF (numPktsFifo.data_count > threshHi) {
+          stallState.next <== States.STALL;
+        } ELSE {
+          stallState.next <== States.COUNTING_UP;
+        }
+      }
+      CASE (States.STALL) {
+        IF (numPktsFifo.data_count < threshLo) {
+          stallState.next <== States.COUNTING_UP;
+        } ELSE {
+          stallState.next <== States.STALL;
+        }
+      }
+    }
+
+  }
+
+  @Override
+  protected void outputFunction() {
+
+    DFEsmValue curFifoOutput = numPktsFifo.output.dataOut;
+    DFEsmValue lastPkt = pktCounter.eq(curFifoOutput-1);
+
+    oIncRdPtr <== iPktVal & lastPkt;
+    oPktCnt   <== pktCounter;
+    oStall    <== stallState.eq(States.STALL);
+
+    debug.printf("[QRdrPktCntSM] cnt=%d : nPkts=%d, nPktsVal=%d, pktVal=%d, oInc=%d, oPktCnt=%d\n",
+                 dbgCnt, iNumPkts, iNumPktsVal, iPktVal, oIncRdPtr, oPktCnt);
+    debug.printf("    fifo.count=%d, fifo.output=%d, fifo.empty=%d\n",
+                 numPktsFifo.data_count, numPktsFifo.output.dataOut, numPktsFifo.output.empty);
+    debug.printf("    stallState=%d, fifoDepth=%d, hi=%d, lo=%d\n",
+                 stallState, fifoDepth, threshHi, threshLo);
+  }
+}

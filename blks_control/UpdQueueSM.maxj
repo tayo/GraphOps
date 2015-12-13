@@ -1,0 +1,489 @@
+package pagerank.kernels;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelLib;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmInput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmOutput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateValue;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateEnum;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmValue;
+import com.maxeler.maxcompiler.v2.statemachine.kernel.KernelStateMachine;
+import com.maxeler.maxcompiler.v2.statemachine.types.DFEsmValueType;
+//import com.maxeler.maxcompiler.v2.statemachine.stdlib.Bitops;
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.buffer.DFEsmFifo;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.Buffer;
+import pagerank.GC;
+
+public class UpdQueueSM extends KernelStateMachine {
+
+  // I/O
+  private final DFEsmInput  iNodeResIn;
+  private final DFEsmInput  iNodeResInVal;
+  private final DFEsmInput  iDataArrayVal;
+  private final DFEsmOutput oMemReqEnWr;
+  private final DFEsmOutput oMemReqAddrWr;
+  private final DFEsmOutput oMemReqEnRd;
+  private final DFEsmOutput oMemReqAddrRd;
+  private final DFEsmOutput oEmptyQ;
+  private final DFEsmOutput oAddrUpd;
+  private final DFEsmOutput oResPkt;
+  private final DFEsmOutput oResBitVec;
+  private final DFEsmOutput oResPktVal;
+  private final DFEsmOutput oStall;
+
+  // State
+  // misc
+  DFEsmStateValue dbgCnt;
+  DFEsmStateValue pktCnt;
+  // outstanding request queue
+  private final int orqDepth = GC.orqDepth;
+  private final int orqPtrWidth = MathUtils.bitsToAddress(orqDepth);
+  DFEsmStateValue[] orqVal;
+  DFEsmStateValue[] orqAddr;
+  DFEsmStateValue[] orqBitVec;
+  DFEsmStateValue[] orqCtr;
+  DFEsmStateValue[][] orqResArray;
+  DFEsmStateValue   orqRdPtr;
+  DFEsmStateValue   orqWrPtr;
+  DFEsmStateValue   orqBitVecNbr;
+  DFEsmStateValue   spaceInORQ;
+  DFEsmStateValue   nodeResD, nodeResValD, nodeInORQ, nbrORQentry;
+  DFEsmStateValue   curAddr; //orqHead
+  DFEsmStateValue   curVal;
+  DFEsmStateValue   curBitVec;
+  DFEsmStateValue   curOrqCtr;
+  DFEsmStateValue[] curResArray;
+
+  /*
+  // waitQFifo
+  private final int waitQDepth = GC.nbrNumRamDepth/2;
+  DFEsmStateValue   waitQCflct;
+  DFEsmFifo waitQFifo;
+  */
+
+  int propWidth      = 32;
+  int parResWidth   = GC.nodeWidth+propWidth;
+  int brstAddrWidth = GC.nodeWidth - GC.pPBBits;
+  int arSize = GC.PROPPERPKT;
+
+  DFEsmValueType orqCtrType   = dfeUInt(16); //ORQ counter type
+  DFEsmValueType propType     = dfeUInt(propWidth); //actually float, but store as int
+  DFEsmValueType parResType   = dfeUInt(parResWidth);
+  DFEsmValueType brstAddrType = dfeUInt(brstAddrWidth);
+  DFEsmValueType resPktType   = dfeUInt(arSize*propWidth);
+
+  DFEsmFifo nodeResFifo;
+
+  // state for asserting stall signal
+  private final int fifoDepth;
+  private final int threshHi;
+  private final int threshLo;
+  public enum States {
+    COUNTING_UP,
+    STALL
+  }
+  private final DFEsmStateEnum<States> stallState;
+
+  public UpdQueueSM(KernelLib owner, int qDepth) {
+    super(owner);
+
+    // Inputs
+    iNodeResIn      = io.input("nodeResIn", parResType);
+    iNodeResInVal   = io.input("nodeResInCtrl", dfeBool());
+    iDataArrayVal   = io.input("arrayCtrl", dfeBool());
+    // Outputs
+    oMemReqEnWr     = io.output("reqEnWr", dfeBool());
+    oMemReqAddrWr   = io.output("reqBrstAddrWr", dfeUInt(GC.brstNbits));
+    oMemReqEnRd     = io.output("reqEnRd", dfeBool());
+    oMemReqAddrRd   = io.output("reqBrstAddrRd", dfeUInt(GC.brstNbits));
+    oEmptyQ         = io.output("emptyQ", dfeBool());
+    oAddrUpd        = io.output("addrToUpdate", brstAddrType);
+    oResPkt         = io.output("resultsPkt", resPktType);
+    oResBitVec      = io.output("resultsBitVec", dfeUInt(GC.PROPPERBRST));
+    oResPktVal      = io.output("resultsPktVal", dfeBool());
+
+    oStall       = io.output("stall", dfeBool());
+    fifoDepth    = qDepth;
+    threshHi     = (int)(0.75*fifoDepth);
+    threshLo     = (int)(0.25*fifoDepth);
+    stallState = state.enumerated(States.class, States.COUNTING_UP);
+
+    // State
+    dbgCnt      = state.value(dfeUInt(32), 0);
+    pktCnt      = state.value(dfeUInt(GC.pktsPBBits), 0);
+    orqVal      = new DFEsmStateValue[orqDepth];
+    orqAddr     = new DFEsmStateValue[orqDepth];
+    orqBitVec   = new DFEsmStateValue[orqDepth];
+    orqCtr      = new DFEsmStateValue[orqDepth];
+    for (int i = 0; i < orqDepth; i++) {
+      orqVal[i]      = state.value(dfeBool(), false);
+      orqAddr[i]     = state.value(brstAddrType, 0);
+      orqBitVec[i]   = state.value(dfeUInt(GC.PROPPERBRST), 0);
+      orqCtr[i]      = state.value(orqCtrType, 0);
+    }
+    orqResArray = new DFEsmStateValue[orqDepth][GC.PROPPERBRST]; 
+    for (int i = 0; i < orqDepth; i++) {
+      for (int j = 0; j < GC.PROPPERBRST; j++) {
+        orqResArray[i][j] = state.value(propType, 0);
+      }
+    }
+    orqRdPtr    = state.value(dfeUInt(orqPtrWidth), 0);
+    orqWrPtr    = state.value(dfeUInt(orqPtrWidth), 0);
+    orqBitVecNbr = state.value(dfeUInt(GC.PROPPERBRST), 0);
+    spaceInORQ  = state.value(dfeBool(), true);
+    nodeResD       = state.value(parResType, 0);
+    nodeResValD    = state.value(dfeBool(), false);
+    nodeInORQ     = state.value(dfeBool(), false);
+    nbrORQentry  = state.value(dfeUInt(orqPtrWidth), 0);
+    curAddr      = state.value(brstAddrType, 0);
+    curVal       = state.value(dfeBool(), false);
+    curBitVec    = state.value(dfeUInt(GC.PROPPERBRST), false);
+    curOrqCtr    = state.value(orqCtrType, 0);
+    curResArray  = new DFEsmStateValue[GC.PROPPERBRST];
+    for (int i = 0; i < GC.PROPPERBRST; i++) {
+      curResArray[i] = state.value(propType, 0); 
+    }
+
+    /*
+    waitQCflct = state.value(dfeBool(), false);
+    Buffer.DFEsmFifoConfig waitQCfg = new Buffer.DFEsmFifoConfig();
+    waitQCfg.setIsFirstWordFallThrough();
+    waitQCfg.setHasDataCount();
+    waitQCfg.setHasValidFlag();
+    waitQFifo = buffer.fifo(parResType, waitQDepth, waitQCfg);
+    */
+
+    Buffer.DFEsmFifoConfig nodeResCfg = new Buffer.DFEsmFifoConfig();
+    nodeResCfg.setIsFirstWordFallThrough();
+    nodeResCfg.setHasDataCount();
+    nodeResCfg.setHasValidFlag();
+    nodeResFifo = buffer.fifo(parResType, qDepth, nodeResCfg);
+  }
+
+  @Override
+  protected void nextState() {
+    dbgCnt.next <== dbgCnt+1;
+    IF (iDataArrayVal)
+      pktCnt.next <== pktCnt+1;
+    ELSE
+      pktCnt.next <== pktCnt;
+    for (int i = 0; i < orqDepth; i++) {
+      orqVal[i].next      <== orqVal[i];
+      orqAddr[i].next     <== orqAddr[i];
+      orqBitVec[i].next   <== orqBitVec[i];
+      orqCtr[i].next      <== orqCtr[i];
+      for (int j = 0; j < GC.PROPPERBRST; j++) {
+        orqResArray[i][j].next <== orqResArray[i][j];
+      }
+    }
+    orqRdPtr.next     <== orqRdPtr;
+    orqWrPtr.next     <== orqWrPtr;
+    orqBitVecNbr.next <== constant.value(dfeUInt(GC.PROPPERBRST), 0); //pulsed
+    spaceInORQ.next <== spaceInORQ;
+    nodeInORQ.next          <== constant.value(false); //pulsed
+    nbrORQentry.next       <== nbrORQentry;
+    // latch iNbrIn
+    nodeResD.next       <== nodeResD;
+    IF (nodeResFifo.output.valid) { nodeResD.next <== nodeResFifo.output.dataOut; }
+    curAddr.next    <== curAddr;
+    curVal.next     <== curVal;
+    curBitVec.next  <== curBitVec;
+    curOrqCtr.next  <== curOrqCtr;
+    for (int i = 0; i < GC.PROPPERBRST; i++) {
+      curResArray[i].next <== curResArray[i];
+    }
+    stallState.next <== stallState;
+    //waitQCflct.next <== constant.value(false); //pulsed
+
+    // nodeResFifo
+    nodeResFifo.input.dataIn      <== iNodeResIn;
+    nodeResFifo.input.writeEnable <== iNodeResInVal;
+    DFEsmValue nodeResVal   = nodeResFifo.output.valid & spaceInORQ; // & ~nbrCflct2;
+    DFEsmValue nodeResIn    = nodeResFifo.output.dataOut;
+    nodeResValD.next        <== nodeResVal;
+    IF (nodeResFifo.input.full) {
+      debug.printf("  --Full-fifo UpdQueueSM..\n");
+    }
+
+    // Stall state machine: Use hysteresis to assert stall signal
+    // assert stall if dataCount > (3/4)depth
+    // de-assert if dataCount < (1/4)depth
+    SWITCH(stallState) {
+      CASE (States.COUNTING_UP) {
+        IF (nodeResFifo.data_count > threshHi) {
+          stallState.next <== States.STALL;
+        } ELSE {
+          stallState.next <== States.COUNTING_UP;
+        }
+      }
+      CASE (States.STALL) {
+        IF (nodeResFifo.data_count < threshLo) {
+          stallState.next <== States.COUNTING_UP;
+        } ELSE {
+          stallState.next <== States.STALL;
+        }
+      }
+    }
+    // waitQFifo
+    //waitQFifo.input.writeEnable <== constant.value(false); //pulsed
+
+    int spaceThresh = 3;
+    int orqAvail = orqDepth-1;
+    IF (orqWrPtr > orqRdPtr) {
+      DFEsmValue used = orqWrPtr - orqRdPtr;
+      spaceInORQ.next <== (orqAvail - used) > spaceThresh;
+    }
+    IF (orqRdPtr > orqWrPtr) {
+      DFEsmValue used = (orqAvail - orqRdPtr) + orqWrPtr;
+      spaceInORQ.next <== (orqAvail - used) > spaceThresh;
+    }
+    nodeResFifo.output.readEnable <== ~nodeResFifo.output.empty & spaceInORQ; // & ~nbrCflct2;
+
+    DFEsmValue resultIn = nodeResIn[propWidth-1:0];
+    DFEsmValue nodeIn   = nodeResIn[parResWidth-1:propWidth];
+    DFEsmValue addrIn   = nodeIn[GC.nodeWidth-1:GC.pPBBits];
+    DFEsmValue idxIn    = nodeIn[GC.pPBBits-1:0];
+
+    // Optimization for sequential memory access:  
+    //   Don't issue read request until it has been N cycles since the bitVec
+    //   was updated --> may not work fully for non-sequential access
+
+    // Incoming read request: check if incoming nbr already exists in ORQ
+    IF (nodeResVal) {
+      DFEsmValue idxDec = bitops.oneHotEncode(idxIn);
+      orqBitVecNbr.next <== idxDec;
+      for (int i = 0; i < orqDepth; i++) {
+        // mark if the incoming data is already in ORQ
+        IF (orqVal[i] & addrIn.eq(orqAddr[i])) {
+          nodeInORQ.next <== constant.value(true);
+          nbrORQentry.next <== constant.value(dfeUInt(orqPtrWidth), i);
+        }
+
+        // handle case of incoming nbr collides with nodeResD value
+        DFEsmValue inDAddr = nodeResD[parResWidth-1:propWidth+GC.pPBBits];
+        IF (nodeResValD & ~nodeInORQ & addrIn.eq(inDAddr)) {
+          nodeInORQ.next <== constant.value(true);
+          nbrORQentry.next <== orqWrPtr;
+        }
+
+        //TODO-if head of ORQ (head-conflict), accumulate the conflicting indices
+      }
+    }
+
+    // Store in ORQ data structure or in waitQ data structure
+    IF (nodeResValD) {
+      DFEsmValue resultD = nodeResD[propWidth-1:0];
+      DFEsmValue nodeD   = nodeResD[parResWidth-1:propWidth];
+      DFEsmValue addrD   = nodeD[GC.nodeWidth-1:GC.pPBBits];
+      DFEsmValue idxD    = nodeD[GC.pPBBits-1:0];
+
+      // update bitVec and resArray
+      IF (nodeInORQ) {
+        for (int i = 0; i < orqDepth; i++) {
+          IF (nbrORQentry.eq(i)) {
+            orqBitVec[i].next <== orqBitVec[i] | orqBitVecNbr;
+            orqCtr[i].next <== constant.value(orqCtrType, 0);
+            for (int j = 0; j < GC.PROPPERBRST; j++) {
+              IF (idxD.eq(j)) {
+                orqResArray[i][j].next <== resultD;
+              }
+            }
+          }
+        }
+      }
+      // If already in ORQ, do we still need the waitQ?
+
+      // Put in ORQ if no existing entry for incoming nbr
+      // Issue the read request for the nbr's property value
+      ELSE {
+        // Issue read request: ctrl = nodeResValD & ~nodeInORQ 
+        //                     addr = nodeResD brst addr
+        orqWrPtr.next <== orqWrPtr+1;  // increment the queue write pointer
+        for (int i = 0; i < orqDepth; i++) {
+          IF (orqWrPtr.eq(i)) {
+            orqVal [i].next <== constant.value(true);
+            orqAddr[i].next <== addrD;
+            orqBitVec[i].next <== orqBitVecNbr;
+            for (int j = 0; j < GC.PROPPERBRST; j++) {
+              IF (idxD.eq(j)) {
+                orqResArray[i][j].next <== resultD;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ORQ counter update
+    // - increment counter if the orq entry is valid and there was not an
+    //   incoming node that hit in this orq entry
+    // - clear counter if orq entry invalid or incoming node hit in this orq entry
+    for (int i = 0; i < orqDepth; i++) {
+      //DFEsmValue incCtr = orqVal[i] & ~(nodeInORQ & nbrORQentry.eq(i));
+        //modify above line of code to only increment for the current orq entry
+        //this prevents subsequent orq ctr entries from running ahead of the ctr limit
+      DFEsmValue incCtr = orqRdPtr.eq(i) & orqVal[i] & ~(nodeInORQ & nbrORQentry.eq(i));
+      IF (incCtr) { orqCtr[i].next <== orqCtr[i]+1; }
+      DFEsmValue clrCtr = ~orqVal[i] | (nodeInORQ & nbrORQentry.eq(i));
+      IF (clrCtr) { orqCtr[i].next <== constant.value(orqCtrType, 0); }
+    }
+      
+    /*
+    ////////////
+    // WaitQ 
+    // insert into waitQ
+    waitQFifo.input.dataIn      <== nodeResD;
+    waitQFifo.input.writeEnable <== nodeResValD & nodeInORQ;
+    // data at the head of the waitQ
+    DFEsmValue waitQNode = waitQFifo.output.dataOut[parResWidth-1:propWidth];
+    DFEsmValue waitQAddr = waitQNode[GC.nodeWidth-1:GC.pPBBits];
+    // determine if conflict with ORQ entries
+    for (int i = 0; i < orqDepth; i++) {
+      DFEsmValue orqAddr = orqAddr[i];
+      IF (orqVal[i] & orqAddr.eq(waitQAddr)) {
+        waitQCflct.next <== constant.value(true);
+      }
+    }
+    // procWaitQ:  conditions for when to pull from waitQ
+    //   no waitQ conflict, nodeResFifo empty, spaceInORQ
+    DFEsmValue procWaitQ = ~waitQCflct & ~waitQFifo.output.empty & 
+                            nodeResFifo.output.empty & spaceInORQ;
+    waitQFifo.output.readEnable <== procWaitQ;
+    DFEsmValue waitQVal = waitQFifo.output.valid & spaceInORQ;
+    IF (waitQVal & procWaitQ) {
+      orqWrPtr.next <== orqWrPtr+1;
+      for (int i = 0; i < orqDepth; i++) {
+        IF (orqWrPtr.eq(i)) {
+          orqNodeRes[i].next <== waitQFifo.output.dataOut;
+          orqVal [i].next <== constant.value(true);
+        }
+      }
+    }
+    */
+    
+
+    // Register brst address and valid status at head of ORQ
+    // Emit parentProp release signal for any invalid heads
+    for (int i = 0; i < orqDepth; i++) {
+      IF (orqRdPtr.eq(i)) {
+        curVal.next    <== orqVal[i];
+        curAddr.next   <== orqAddr[i];
+        curBitVec.next <== orqBitVec[i];
+        curOrqCtr.next <== orqCtr[i];
+        for (int j = 0; j < GC.PROPPERBRST; j++) {
+          curResArray[j].next <== orqResArray[i][j];
+        }
+      }
+    }
+
+
+    //   DataArrayVal
+    //   If head of ORQ is a valid entry, then issue new write request upon
+    //   reception of the first pkt of the burst
+    //   ctrl = curVal & pktCnt.eq(0)  addr = curAddr
+    IF (iDataArrayVal) {
+      // last pkt of the burst
+      IF (pktCnt.eq(GC.PKTSPERBRST-1)) {
+        orqRdPtr.next <== orqRdPtr+1;
+        for (int i = 0; i < orqDepth; i++) {
+          IF (orqRdPtr.eq(i)) {
+            orqVal[i].next    <== constant.value(false);
+            orqBitVec[i].next <== constant.value(dfeUInt(GC.PROPPERBRST), 0);
+            curVal.next       <== orqVal[(i+1)%orqDepth];
+            curAddr.next      <== orqAddr[(i+1)%orqDepth];
+            curBitVec.next    <== orqBitVec[(i+1)%orqDepth];
+            curOrqCtr.next    <== orqCtr[(i+1)%orqDepth];
+            for (int j = 0; j < GC.PROPPERBRST; j++) {
+              curResArray[j].next <== orqResArray[(i+1)%orqDepth][j];
+            }
+          }
+        }
+      }
+    }
+
+
+  }
+
+  @Override
+  protected void outputFunction() {
+    int bufBits  = GC.brstNbits - brstAddrWidth;
+    int propWidth = 32;
+
+    oEmptyQ       <== orqRdPtr.eq(orqWrPtr) & nodeResFifo.output.empty & 
+                        ~iNodeResInVal & ~nodeResValD;
+                        //& waitQFifo.output.empty & ~waitQFifo.output.valid;
+    oAddrUpd      <== curAddr;
+
+    // Results array output
+    oResPktVal <== iDataArrayVal;
+    oResBitVec <== curBitVec;
+    IF (pktCnt.eq(0))
+      oResPkt <== curResArray[15]#curResArray[14]#curResArray[13]#curResArray[12]#
+                  curResArray[11]#curResArray[10]#curResArray[ 9]#curResArray[ 8]#
+                  curResArray[ 7]#curResArray[ 6]#curResArray[ 5]#curResArray[ 4]#
+                  curResArray[ 3]#curResArray[ 2]#curResArray[ 1]#curResArray[ 0];
+    ELSE
+      oResPkt <== curResArray[31]#curResArray[30]#curResArray[29]#curResArray[28]#
+                  curResArray[27]#curResArray[26]#curResArray[25]#curResArray[24]#
+                  curResArray[23]#curResArray[22]#curResArray[21]#curResArray[20]#
+                  curResArray[19]#curResArray[18]#curResArray[17]#curResArray[16];
+
+    // Memory Request Outputs: Write
+    oMemReqEnWr   <== iDataArrayVal & curVal & pktCnt.eq(0);
+    oMemReqAddrWr <== constant.value(dfeUInt(bufBits), 0) # curAddr;
+
+    // Memory Request Outputs: Read from incoming nodeRes or from waitQ nodeRes
+    //DFEsmValue procWaitQ = ~waitQCflct & ~waitQFifo.output.empty & 
+    //                        nodeResFifo.output.empty & spaceInORQ;
+    //oMemReqEnRd   <== (nodeResValD & ~nodeInORQ); // | procWaitQ;  
+
+    oMemReqEnRd   <== curOrqCtr.eq(64);
+
+    DFEsmValue nodeD = nodeResD[parResWidth-1:propWidth];
+    DFEsmValue nodeDAddr = nodeD[GC.nodeWidth-1:GC.pPBBits];
+    //oMemReqAddrRd <== constant.value(dfeUInt(bufBits), 0) # nodeDAddr;
+    oMemReqAddrRd <== constant.value(dfeUInt(bufBits), 0) # curAddr;
+    oStall    <== stallState.eq(States.STALL);
+
+    /*
+    DFEsmValue waitQNode = waitQFifo.output.dataOut[parResWidth-1:propWidth];
+    DFEsmValue waitQAddr = waitQNode[GC.nodeWidth-1:GC.pPBBits];
+    IF (procWaitQ) {
+      oMemReqAddrRd <== constant.value(dfeUInt(bufBits), 0) # waitQAddr;
+    } ELSE {
+      oMemReqAddrRd <== constant.value(dfeUInt(bufBits), 0) # nodeDAddr;
+    }
+    */
+
+    // temp variables 
+    DFEsmValue nodeResVal = nodeResFifo.output.valid & spaceInORQ; // & ~nbrCflct2;
+    DFEsmValue nodeIn  = iNodeResIn[parResWidth-1:propWidth];
+    DFEsmValue readEn = ~nodeResFifo.output.empty & spaceInORQ; // & ~nbrCflct2;
+    //DFEsmValue waitQVal = waitQFifo.output.valid & spaceInORQ;
+
+    debug.printf("[UpdQueueSM] cnt=%d : nodeIn=%d, nodeResVal=%d, ArrayVal=%d, pktCnt=%d\n",
+      dbgCnt, nodeIn, iNodeResInVal, iDataArrayVal, pktCnt);
+    debug.printf("    ORQ: rdPtr=%d, wrPtr=%d, cur: [addr=%d val=%d bitvec=%o]\n", 
+                 orqRdPtr, orqWrPtr, curAddr, curVal, curBitVec);
+    debug.printf("    nodeResFifo: nbr=%d, val=%d, readEn=%d, empty=%d, cnt=%d\n",
+      nodeResFifo.output.dataOut[parResWidth-1:propWidth], nodeResVal, 
+      readEn, nodeResFifo.output.empty, nodeResFifo.data_count);
+    debug.printf("    stallState=%d, fifoDepth=%d, hi=%d, lo=%d\n",
+                 stallState, fifoDepth, threshHi, threshLo);
+    debug.printf("    nodeResD=%d, nodeInORQ=%d, nbrORQentry=%d, nodeResValD=%d\n",
+      nodeD, nodeInORQ, nbrORQentry, nodeResValD);
+                      //TODO: check to make sure the head of the waitQ is correct
+    //debug.printf("    waitQFifo: outputNode=%d, val=%d, cflct=%d, readEn=%d, empty=%d, cnt=%d\n",
+    //  waitQNode, waitQVal, waitQCflct, procWaitQ, 
+    //  waitQFifo.output.empty, waitQFifo.data_count);
+    debug.printf("    addrUpd=%d, emptyQ=%d, resPktVal=%d\n",
+      oAddrUpd, oEmptyQ, oResPktVal);
+    debug.printf("    ReqEnRd=%d, ReqAddrRd=%d, reqEnWr=%d, reqAddrWr=%d\n",
+      oMemReqEnRd, oMemReqAddrRd, oMemReqEnWr, oMemReqAddrWr);
+    debug.printf("    ORQ entries:\n"); 
+    for (int i = 0; i < orqDepth; i+=2) {
+      debug.printf("      ORQ_%d[val=%d addr=%d ctr=%d bitvec=%o]  ORQ_%d[val=%d addr=%d ctr=%d bitvec=%o]\n",
+        i, orqVal[i], orqAddr[i], orqCtr[i], orqBitVec[i],
+        i+1, orqVal[i+1], orqAddr[i+1], orqCtr[i+1], orqBitVec[i+1]);
+    }
+  }
+}

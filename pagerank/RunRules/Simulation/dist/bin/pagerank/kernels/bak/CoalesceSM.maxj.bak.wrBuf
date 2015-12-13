@@ -1,0 +1,550 @@
+/*
+ *
+ */
+
+package graph_accel.kernels;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelLib;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmInput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmOutput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateValue;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmValue;
+import com.maxeler.maxcompiler.v2.statemachine.kernel.KernelStateMachine;
+import com.maxeler.maxcompiler.v2.statemachine.types.DFEsmValueType;
+import com.maxeler.maxcompiler.v2.statemachine.stdlib.Bitops;
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+import graph_accel.GC;
+
+public class CoalesceSM extends KernelStateMachine {
+
+  // I/O
+  private final DFEsmInput  iNbrIn;
+  private final DFEsmInput  iNbrInVal;
+  private final DFEsmInput  iCurLvl;
+  private final DFEsmInput  iDataArray;
+  private final DFEsmInput  iDataArrayVal;
+  private final DFEsmOutput oUpdNbrsBase;
+  private final DFEsmOutput oUpdNbrsCtrl;
+  private final DFEsmOutput oUpdNbrsBitVec;
+  private final DFEsmOutput oPropArray;
+  private final DFEsmOutput oPropArrayVal;
+  private final DFEsmOutput oMemReqEn;
+  private final DFEsmOutput oMemReqAddr;
+  private final DFEsmOutput oMemReqEnRd;
+  private final DFEsmOutput oMemReqAddrRd;
+  private final DFEsmOutput oEmptyQ;
+
+  // State
+  // misc
+  DFEsmStateValue dbgCnt;
+  DFEsmStateValue pktCnt;
+  // outstanding request queue
+  private final int orqDepth = 32; //128; //256
+  private final int orqPtrWidth = MathUtils.bitsToAddress(orqDepth);
+  DFEsmStateValue[] orqVal;
+  DFEsmStateValue[] orqAddr;
+  DFEsmStateValue[] orqBitVec;
+  DFEsmStateValue   orqRdPtr;
+  DFEsmStateValue   orqWrPtr;
+  DFEsmStateValue   nbrInD, nbrInValD, nbrInORQ, nbrORQentry;
+  DFEsmStateValue   orqBitVecNbr;
+  DFEsmStateValue   curBitVec;
+  DFEsmStateValue   curAddr;
+  DFEsmStateValue   bitVecUpd;
+  DFEsmStateValue   addrUpd;
+  // writebuffer
+  private final int wrBufDepth = 16; //16;  //32
+  private final int wrBufPtrWidth = MathUtils.bitsToAddress(wrBufDepth);
+  private final int wrBufDataDepth = wrBufDepth*GC.PKTSPERBRST;
+  DFEsmStateValue[] wrBufAddr;
+  DFEsmStateValue[] wrBufVal;
+  DFEsmStateValue[] wrBufData;
+  DFEsmStateValue[] dataInBuf;
+  DFEsmStateValue[] dataOutBuf;
+  DFEsmStateValue   dataOutBufCtr;
+  DFEsmStateValue   dataOutBufVal;
+  DFEsmStateValue   wrBufWrPtr, nxtFreeWrBuf;
+  DFEsmStateValue   wrBufMergePtr, wrBufMergePtr2;
+  DFEsmStateValue   doMergeData, doStoreData, doUpdate;
+  DFEsmStateValue   doMergeData2, doStoreData2, doUpdate2;
+  DFEsmStateValue   noWrBufReqEn, noWrBufReqAddr;
+  DFEsmStateValue   mrgDataOutReqEn, mrgDataOutReqAddr;
+  DFEsmStateValue[][] oArray;
+
+  DFEsmValueType pktType  = dfeUInt(GC.PKTWIDTH);
+  DFEsmValueType nbrType  = dfeUInt(GC.coalesceNbrWidth);
+  DFEsmValueType propType = dfeUInt(GC.PROPWIDTH);
+  DFEsmValueType bitVecType = dfeUInt(GC.PROPPERBRST);
+  int brstAddrWidth = GC.coalesceNbrWidth - GC.pPBBits;
+  DFEsmValueType brstAddrType = dfeUInt(brstAddrWidth);
+  int arSize = GC.PROPPERPKT;
+
+  public CoalesceSM(KernelLib owner) {
+    super(owner);
+
+    // Inputs
+    iNbrIn        = io.input("nbrIn", nbrType);
+    iNbrInVal     = io.input("nbrInVal", dfeBool());
+    iCurLvl       = io.input("curLvl", dfeUInt(GC.PROPWIDTH));
+    iDataArray    = io.input("dataArrayIn", pktType);
+    iDataArrayVal = io.input("dataArrayInVal", dfeBool());
+    // Outputs
+    oUpdNbrsCtrl   = io.output("updNbrsCtrl", dfeBool());
+    oUpdNbrsBase   = io.output("updNbrs", brstAddrType);
+    oUpdNbrsBitVec = io.output("updNbrsBitVec", bitVecType);
+    oPropArray    = io.output("dataArrayOut", pktType);
+    oPropArrayVal = io.output("dataArrayOutVal", dfeBool());
+    oMemReqEn     = io.output("reqEn", dfeBool());
+    oMemReqAddr   = io.output("reqBrstAddr", dfeUInt(GC.brstNbits));
+    oMemReqEnRd   = io.output("reqEnRd", dfeBool());
+    oMemReqAddrRd = io.output("reqBrstAddrRd", dfeUInt(GC.brstNbits));
+    oEmptyQ       = io.output("emptyQ", dfeBool());
+
+    // State
+    dbgCnt      = state.value(dfeUInt(32), 0);
+    pktCnt      = state.value(dfeUInt(GC.pktsPBBits), 0);
+    orqVal      = new DFEsmStateValue[orqDepth];
+    orqAddr     = new DFEsmStateValue[orqDepth];
+    orqBitVec   = new DFEsmStateValue[orqDepth];
+    for (int i = 0; i < orqDepth; i++) {
+      orqVal[i] = state.value(dfeBool(), false);
+      orqAddr[i] = state.value(brstAddrType, 0);
+      orqBitVec[i] = state.value(bitVecType, 0);
+    }
+    orqRdPtr    = state.value(dfeUInt(orqPtrWidth), 0);
+    orqWrPtr    = state.value(dfeUInt(orqPtrWidth), 0);
+    nbrInD       = state.value(nbrType, 0);
+    nbrInValD    = state.value(dfeBool(), false);
+    nbrInORQ     = state.value(dfeBool(), false);
+    nbrORQentry  = state.value(dfeUInt(orqPtrWidth), 0);
+    orqBitVecNbr = state.value(bitVecType, 0);
+
+    curAddr      = state.value(brstAddrType, 0);
+    curBitVec    = state.value(bitVecType, 0);
+    bitVecUpd    = state.value(bitVecType, 0);
+    addrUpd      = state.value(brstAddrType, 0);
+
+    wrBufAddr   = new DFEsmStateValue[wrBufDepth];
+    wrBufVal    = new DFEsmStateValue[wrBufDepth];
+    for (int i = 0; i < wrBufDepth; i++) {
+      wrBufAddr[i] = state.value(brstAddrType, 0);
+      wrBufVal[i] = state.value(dfeBool(), false);
+    }
+    wrBufData   = new DFEsmStateValue[wrBufDataDepth];
+    for (int i = 0; i < wrBufDataDepth; i++) {
+      wrBufData[i] = state.value(pktType, 0);
+    }
+    dataInBuf   = new DFEsmStateValue[GC.PKTSPERBRST];
+    dataOutBuf   = new DFEsmStateValue[GC.PKTSPERBRST];
+    for (int i = 0; i < GC.PKTSPERBRST; i++) {
+      dataInBuf[i] = state.value(pktType, 0);
+      dataOutBuf[i] = state.value(pktType, 0);
+    }
+    dataOutBufCtr = state.value(dfeUInt(GC.pktsPBBits), 0);
+    dataOutBufVal = state.value(dfeBool(), 0);
+    wrBufWrPtr = state.value(dfeUInt(wrBufPtrWidth), 0);
+    nxtFreeWrBuf = state.value(dfeUInt(wrBufPtrWidth), 1);
+    wrBufMergePtr  = state.value(dfeUInt(wrBufPtrWidth), 0);
+    wrBufMergePtr2 = state.value(dfeUInt(wrBufPtrWidth), 0);
+    doMergeData = state.value(dfeBool(), false);
+    doStoreData = state.value(dfeBool(), false);
+    doUpdate = state.value(dfeBool(), false);
+    doMergeData2 = state.value(dfeBool(), false);
+    doStoreData2 = state.value(dfeBool(), false);
+    doUpdate2    = state.value(dfeBool(), false);
+    noWrBufReqEn   = state.value(dfeBool(), false);
+    noWrBufReqAddr = state.value(brstAddrType, 0);
+    mrgDataOutReqEn   = state.value(dfeBool(), false);
+    mrgDataOutReqAddr = state.value(brstAddrType, 0);
+    oArray = new DFEsmStateValue[GC.PKTSPERBRST][arSize];
+    for (int i = 0; i < GC.PKTSPERBRST; i++) {
+      //oArray[i] = new DFEsmStateValue[arSize];
+      for (int j = 0; j < arSize; j++) 
+        oArray[i][j] = state.value(dfeUInt(GC.PROPWIDTH), 0);
+    }
+  }
+
+  @Override
+  protected void nextState() {
+    dbgCnt.next <== dbgCnt+1;
+    IF (iDataArrayVal)
+      pktCnt.next <== pktCnt+1;
+    ELSE
+      pktCnt.next <== pktCnt;
+    for (int i = 0; i < orqDepth; i++) {
+      orqAddr[i].next <== orqAddr[i];
+      orqVal[i].next <== orqVal[i];
+      orqBitVec[i].next <== orqBitVec[i];
+    }
+    orqRdPtr.next <== orqRdPtr;
+    orqWrPtr.next <== orqWrPtr;
+    nbrInORQ.next          <== constant.value(false); //pulsed
+    nbrORQentry.next       <== nbrORQentry;
+    // latch iNbrIn
+    nbrInD.next       <== nbrInD;
+    nbrInValD.next    <== iNbrInVal;
+    IF (iNbrInVal) { nbrInD.next <== iNbrIn; }
+    orqBitVecNbr.next <== constant.value(bitVecType, 0); //pulsed
+    curBitVec.next    <== curBitVec;
+    curAddr.next      <== curAddr;
+    bitVecUpd.next    <== bitVecUpd;
+    addrUpd.next      <== addrUpd;
+
+    for (int i = 0; i < wrBufDepth; i++) {
+      wrBufAddr[i].next <== wrBufAddr[i];
+      wrBufVal[i].next <== wrBufVal[i];
+    }
+    for (int i = 0; i < wrBufDataDepth; i++) {
+      wrBufData[i].next <== wrBufData[i];
+    }
+    for (int i = 0; i < GC.PKTSPERBRST; i++) {
+      dataInBuf[i].next <== dataInBuf[i];
+      dataOutBuf[i].next <== dataOutBuf[i];
+    }
+    dataOutBufCtr.next <== dataOutBufCtr;
+    dataOutBufVal.next <== constant.value(false); //pulsed
+    wrBufWrPtr.next <== wrBufWrPtr;
+    nxtFreeWrBuf.next <== nxtFreeWrBuf;
+    wrBufMergePtr.next  <== wrBufMergePtr;
+    wrBufMergePtr2.next <== wrBufMergePtr2;
+    doMergeData.next <== doMergeData;
+    doStoreData.next <== doStoreData;
+    doUpdate.next <== doUpdate;
+    doMergeData2.next <== constant.value(false); //pulsed
+    doStoreData2.next <== constant.value(false); //pulsed
+    doUpdate2.next    <== constant.value(false); //pulsed
+    for (int i = 0; i < GC.PKTSPERBRST; i++) {
+      for (int j = 0; j < arSize; j++)
+        oArray[i][j].next <== oArray[i][j];
+    }
+    noWrBufReqEn.next   <== constant.value(false); //pulsed
+    noWrBufReqAddr.next <== noWrBufReqAddr;
+    mrgDataOutReqEn.next   <== constant.value(false); //pulsed
+    mrgDataOutReqAddr.next <== mrgDataOutReqAddr;
+
+    // wrBufWrPtr handling: determine next free wrBuf entry
+    IF (wrBufWrPtr.eq(nxtFreeWrBuf)) {
+      //DFEsmValue nxtFree = findFreeWrBufEntry();
+      //nxtFreeWrBuf.next <== nxtFree;
+  IF (~wrBufVal[0] & wrBufWrPtr.neq(0)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 0);
+  ELSE IF (~wrBufVal[1] & wrBufWrPtr.neq(1)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 1);
+  ELSE IF (~wrBufVal[2] & wrBufWrPtr.neq(2)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 2);
+  ELSE IF (~wrBufVal[3] & wrBufWrPtr.neq(3)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 3);
+  ELSE IF (~wrBufVal[4] & wrBufWrPtr.neq(4)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 4);
+  ELSE IF (~wrBufVal[5] & wrBufWrPtr.neq(5)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 5);
+  ELSE IF (~wrBufVal[6] & wrBufWrPtr.neq(6)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 6);
+  ELSE IF (~wrBufVal[7] & wrBufWrPtr.neq(7)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 7);
+  ELSE IF (~wrBufVal[8] & wrBufWrPtr.neq(8)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 8);
+  ELSE IF (~wrBufVal[9] & wrBufWrPtr.neq(9)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 9);
+  ELSE IF (~wrBufVal[10] & wrBufWrPtr.neq(10)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 10);
+  ELSE IF (~wrBufVal[11] & wrBufWrPtr.neq(11)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 11);
+  ELSE IF (~wrBufVal[12] & wrBufWrPtr.neq(12)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 12);
+  ELSE IF (~wrBufVal[13] & wrBufWrPtr.neq(13)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 13);
+  ELSE IF (~wrBufVal[14] & wrBufWrPtr.neq(14)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 14);
+  ELSE IF (~wrBufVal[15] & wrBufWrPtr.neq(15)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 15);
+/*  ELSE IF (~wrBufVal[16] & wrBufWrPtr.neq(16)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 16);
+  ELSE IF (~wrBufVal[17] & wrBufWrPtr.neq(17)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 17);
+  ELSE IF (~wrBufVal[18] & wrBufWrPtr.neq(18)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 18);
+  ELSE IF (~wrBufVal[19] & wrBufWrPtr.neq(19)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 19);
+  ELSE IF (~wrBufVal[20] & wrBufWrPtr.neq(20)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 20);
+  ELSE IF (~wrBufVal[21] & wrBufWrPtr.neq(21)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 21);
+  ELSE IF (~wrBufVal[22] & wrBufWrPtr.neq(22)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 22);
+  ELSE IF (~wrBufVal[23] & wrBufWrPtr.neq(23)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 23);
+  ELSE IF (~wrBufVal[24] & wrBufWrPtr.neq(24)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 24);
+  ELSE IF (~wrBufVal[25] & wrBufWrPtr.neq(25)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 25);
+  ELSE IF (~wrBufVal[26] & wrBufWrPtr.neq(26)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 26);
+  ELSE IF (~wrBufVal[27] & wrBufWrPtr.neq(27)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 27);
+  ELSE IF (~wrBufVal[28] & wrBufWrPtr.neq(28)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 28);
+  ELSE IF (~wrBufVal[29] & wrBufWrPtr.neq(29)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 29);
+  ELSE IF (~wrBufVal[30] & wrBufWrPtr.neq(30)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 30);
+  ELSE IF (~wrBufVal[31] & wrBufWrPtr.neq(31)) nxtFreeWrBuf.next <== constant.value(dfeUInt(wrBufPtrWidth), 31);
+  */
+  ELSE {
+    debug.printf("    --Error-- Could not find a wrBuf free entry..\n");
+  }
+      //debug.printf("    --New WrBuf-- old = %d , new = %d\n", wrBufWrPtr, nxtFree);
+    }
+
+    // Incoming read request: check if incoming nbr already exists in ORQ
+    IF (iNbrInVal) {
+      DFEsmValue nbrInAddr = iNbrIn[GC.coalesceNbrWidth-1:GC.pPBBits];
+      for (int i = 0; i < orqDepth; i++) {
+        IF (orqVal[i] & orqAddr[i].eq(nbrInAddr)) {
+          nbrInORQ.next <== constant.value(true);
+          nbrORQentry.next <== constant.value(dfeUInt(orqPtrWidth), i);
+        }
+      }
+      DFEsmValue nbrInIdx = iNbrIn[GC.pPBBits-1:0];
+      DFEsmValue idxDec = bitops.oneHotEncode(nbrInIdx);
+      orqBitVecNbr.next <== idxDec;
+    }
+    // Store in ORQ data structure
+    IF (nbrInValD) {
+      // update the bitVec if address exists in ORQ
+      IF (nbrInORQ) {
+        for (int i = 0; i < orqDepth; i++) {
+          IF (nbrORQentry.eq(i)) {
+            orqBitVec[i].next <== orqBitVec[i] | orqBitVecNbr;
+          }
+        }
+      }
+      // append to ORQ if no existing entry for incoming nbr
+      ELSE {
+        orqWrPtr.next <== orqWrPtr+1;  // increment the queue write pointer
+        for (int i = 0; i < orqDepth; i++) {
+          IF (orqWrPtr.eq(i)) {
+            orqAddr  [i].next <== nbrInD[GC.coalesceNbrWidth-1:GC.pPBBits]; 
+            orqVal   [i].next <== constant.value(true);
+            orqBitVec[i].next <== orqBitVec[i] | orqBitVecNbr;
+          }
+        }
+      }
+    }
+
+    // Register brst address and bit-vector at head of ORQ
+    for (int i = 0; i < orqDepth; i++) {
+      IF (orqRdPtr.eq(i) & orqVal[i]) {
+        curAddr.next   <== orqAddr[i];
+        curBitVec.next <== orqBitVec[i];
+      }
+    }
+
+    // Determine if incoming data will be merged in writebuffer or not
+    // (if addr is already in writebuffer, then assert merge flag)
+    for (int i = 0; i < wrBufDepth; i++) {
+      IF (wrBufVal[i] & wrBufAddr[i].eq(curAddr)) {
+        doMergeData.next <== constant.value(true);
+        wrBufMergePtr.next <== constant.value(dfeUInt(wrBufPtrWidth), i);
+      }
+    }
+
+    // Incoming data packet
+    IF (iDataArrayVal) {
+      // capture incoming burst into holding buffer
+      for (int i = 0; i < GC.PKTSPERBRST; i++) {
+        IF (pktCnt.eq(i)) {
+          dataInBuf[i].next <== iDataArray;
+        }
+      }
+
+      // supports only 2 pkts per brst (pktCnt = 0 or 1)
+      DFEsmValue bitVecSection; 
+      IF (pktCnt.eq(0)) bitVecSection = curBitVec[GC.PROPPERBRST/2-1 : 0];
+      ELSE bitVecSection = curBitVec[GC.PROPPERBRST-1   : GC.PROPPERBRST/2]; 
+
+      // check to see if update is needed
+      for (int i = 0; i < arSize; i++) {
+        DFEsmValue elemData = iDataArray[(i+1)*GC.PROPWIDTH-1 : i*GC.PROPWIDTH];
+        IF (bitVecSection[i] & elemData>10000) { //elemData == -1 ?
+          doUpdate.next <== constant.value(true);
+        }
+      }
+
+      // upon burst completion
+      IF (pktCnt.eq(GC.PKTSPERBRST-1)) {
+        orqRdPtr.next <== orqRdPtr+1;  //increment ORQ read pointer
+        bitVecUpd.next <== curBitVec;  //register the bit-vector to use in updating
+        addrUpd.next   <== curAddr;
+        // invalidate the ORQ entry
+        for (int i = 0; i < orqDepth; i++) {
+          IF (orqRdPtr.eq(i)) { 
+            orqVal[i].next <== constant.value(false);
+            curAddr.next   <== orqAddr[(i+1)%orqDepth];
+            curBitVec.next <== orqBitVec[(i+1)%orqDepth];
+          }
+        }
+      }
+    }
+
+    // When burst has been completely received:  
+    //   Perform update in writebuffer or issue write to memory
+    IF (doUpdate & pktCnt.eq(0)) {
+      //TODO: find a different place to clear these signals
+      //      could potentially cause processing of incoming nbr to overlap with outgoing?
+      doUpdate.next <== constant.value(false);
+      doMergeData.next <== constant.value(false);
+      doStoreData.next <== constant.value(false);
+      doUpdate2.next <== constant.value(true);
+      doMergeData2.next <== doMergeData;
+      wrBufMergePtr2.next <== wrBufMergePtr;
+      doStoreData2.next <== doStoreData;
+
+      for (int i = 0; i < wrBufDepth; i++) {
+        int ptrBase = i*GC.PKTSPERBRST;
+        for (int j = 0; j < GC.PKTSPERBRST; j++) {
+
+          // Merge: merge with entry in wrBuf
+          IF (wrBufMergePtr.eq(i) & doMergeData) {
+            for (int k = 0; k < arSize; k++) {
+              IF (bitVecUpd[j*arSize + k])
+                oArray[j][k].next <== iCurLvl+1;
+              ELSE {
+                DFEsmValue bufData = 
+                  wrBufData[ptrBase+j][(k+1)*GC.PROPWIDTH-1 : k*GC.PROPWIDTH];
+                oArray[j][k].next <== bufData.cast(propType);
+              }
+            }
+          }
+
+          // No merge
+          // - If storeData is asserted, just store in the buffer and don't write
+          //   to memory.  Otherwise, generate a write to memory.
+          IF (~doMergeData) {
+            for (int k = 0; k < arSize; k++) {
+              IF (bitVecUpd[j*arSize + k])
+                oArray[j][k].next <== iCurLvl+1;
+              ELSE {
+                DFEsmValue inData = 
+                  dataInBuf[j][(k+1)*GC.PROPWIDTH-1 : k*GC.PROPWIDTH];
+                oArray[j][k].next <== inData.cast(propType);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Completion of updates to wrBuf entries
+    for (int i = 0; i < wrBufDepth; i++) {
+      int ptrBase = i*GC.PKTSPERBRST;
+      for (int j = 0; j < GC.PKTSPERBRST; j++) {
+
+        DFEsmValue dataOut =
+          oArray[j][31] # oArray[j][30] # oArray[j][29] # oArray[j][28] # 
+          oArray[j][27] # oArray[j][26] # oArray[j][25] # oArray[j][24] # 
+          oArray[j][23] # oArray[j][22] # oArray[j][21] # oArray[j][20] # 
+          oArray[j][19] # oArray[j][18] # oArray[j][17] # oArray[j][16] # 
+          oArray[j][15] # oArray[j][14] # oArray[j][13] # oArray[j][12] # 
+          oArray[j][11] # oArray[j][10] # oArray[j][ 9] # oArray[j][ 8] # 
+          oArray[j][ 7] # oArray[j][ 6] # oArray[j][ 5] # oArray[j][ 4] # 
+          oArray[j][ 3] # oArray[j][ 2] # oArray[j][ 1] # oArray[j][ 0] ;
+
+        IF ( (doUpdate2 & doMergeData2 & wrBufMergePtr2.eq(i)) |
+             (doUpdate2 & doStoreData2 & wrBufWrPtr.eq(i)) ) {
+          wrBufData[ptrBase+j].next <== dataOut;
+        }
+        IF (doUpdate2) {
+          dataOutBuf[j].next <== dataOut;
+        }
+      }
+      // writeback originating from mrgBuf. invalidate entry
+      IF (doUpdate2 & ~doStoreData2 & doMergeData2 & wrBufMergePtr2.eq(i)) {
+        wrBufVal[i].next <== constant.value(false);
+        dataOutBufCtr.next <== dataOutBufCtr+1;
+        dataOutBufVal.next <== constant.value(true);
+        mrgDataOutReqEn.next <== constant.value(true);
+        mrgDataOutReqAddr.next <== wrBufAddr[i];
+      }
+      IF (doStoreData2 & wrBufWrPtr.eq(i)) {
+        wrBufVal[i].next  <== constant.value(true);
+        wrBufAddr[i].next <== addrUpd;
+      }
+    }
+    // writeback originating from incoming data
+    IF (doUpdate2 & ~doStoreData2 & ~doMergeData2) {
+      dataOutBufCtr.next <== dataOutBufCtr+1;
+      dataOutBufVal.next <== constant.value(true);
+      noWrBufReqEn.next   <== constant.value(true);
+      noWrBufReqAddr.next <== addrUpd;
+    }
+    IF (doStoreData2) {
+      wrBufWrPtr.next <== nxtFreeWrBuf;
+    }
+
+    // Completing writeback
+    IF (dataOutBufCtr > 0) {
+      dataOutBufVal.next <== constant.value(true);
+      dataOutBufCtr.next <== dataOutBufCtr+1;
+    }
+
+  }
+
+  @Override
+  protected void outputFunction() {
+    int bufBits = GC.brstNbits - brstAddrWidth;
+
+    oEmptyQ         <== orqRdPtr.eq(orqWrPtr);
+
+    oUpdNbrsCtrl    <== noWrBufReqEn | mrgDataOutReqEn;
+
+    // Memory Request Outputs: Write
+    oMemReqEn   <== noWrBufReqEn | mrgDataOutReqEn;
+    IF (mrgDataOutReqEn) {
+      oMemReqAddr    <== constant.value(dfeUInt(bufBits), 0) # mrgDataOutReqAddr;
+      oUpdNbrsBase   <== constant.value(dfeUInt(bufBits), 0) # mrgDataOutReqAddr;
+      oUpdNbrsBitVec <== bitVecUpd;
+    } ELSE {
+      oMemReqAddr    <== constant.value(dfeUInt(bufBits), 0) # noWrBufReqAddr;
+      oUpdNbrsBase   <== constant.value(dfeUInt(bufBits), 0) # noWrBufReqAddr;
+      oUpdNbrsBitVec <== bitVecUpd;
+    }
+
+    // Memory Request Outputs: Read request if the nbr is not already in ORQ
+    oMemReqEnRd  <== nbrInValD & ~nbrInORQ;
+    oMemReqAddrRd <== constant.value(dfeUInt(bufBits), 0) # 
+                      nbrInD[GC.coalesceNbrWidth-1:GC.pPBBits];
+
+    // Data Array Outputs
+    oPropArrayVal <== dataOutBufVal;
+    IF (dataOutBufCtr.eq(0)) 
+      oPropArray <== dataOutBuf[1];
+    ELSE 
+      oPropArray <== dataOutBuf[0];
+
+    debug.printf("[CoalesceSM] cnt=%d : nbrIn=%d, nbrInVal=%d, ArrayVal=%d, pktCnt=%d\n",
+      dbgCnt, iNbrIn, iNbrInVal, iDataArrayVal, pktCnt);
+    debug.printf("    orq.rdPtr=%d, orq.wrPtr=%d, wrBufWrPtr=%d (nxt=%d)\n", 
+      orqRdPtr, orqWrPtr, wrBufWrPtr, nxtFreeWrBuf);
+    debug.printf("    nbrInD=%d, nbrInORQ=%d, nbrORQentry=%d, nbrInValD=%d, orqBitVecNbr=%o\n",
+      nbrInD, nbrInORQ, nbrORQentry, nbrInValD, orqBitVecNbr);
+    debug.printf("    curAddr=%d, curBitVec=%o, addrUpd=%d, bitVecUpd=%o\n",
+      curAddr, curBitVec, addrUpd, bitVecUpd);
+    debug.printf("    memReqEnRd=%d, memReqAddrRd=%d\n",
+      oMemReqEnRd, oMemReqAddrRd);
+    debug.printf("    doUpdate=%d, doMerge=%d, doStore=%d, wrBufMrgPtr=%d, nbrToEx=%d\n",
+      doUpdate, doMergeData, doStoreData, wrBufMergePtr, nbrToExamine);
+    debug.printf("    doUpd2=%d, doMrg2=%d, doStore2=%d, wrBufMrgPtr2=%d\n",
+      doUpdate2, doMergeData2, doStoreData2, wrBufMergePtr2);
+    debug.printf("    dOutVal=%d, dOutCtr=%d, noWrBufReqEn=%d, noWrReqAddr=%d, mrgDBufReqEn=%d, mrgReqAddr=%d\n",
+      dataOutBufVal, dataOutBufCtr, noWrBufReqEn, noWrBufReqAddr, mrgDataOutReqEn, mrgDataOutReqAddr);
+    //////
+    //temp
+    debug.printf("    wrBuf: ");
+    for (int i = 0; i < wrBufDepth; i++) {
+      debug.printf("[%d]v=%d,addr=%d ", i, wrBufVal[i], wrBufAddr[i]);
+    }
+    debug.printf("\n");
+    IF (dataOutBufVal) {
+      debug.printf("    dataOutBuf:\n ");
+      for (int i = 0; i < 2; i++) 
+        debug.printf("    %x\n", dataOutBuf[i]);
+    }
+    /*
+    IF (dataOutBufVal) {
+      debug.printf("    oPropArray : ");
+      for (int i = arSize-1; i >= 0; i--) 
+        debug.printf("%x ", oPropArray[(i+1)*GC.PROPWIDTH-1:i*GC.PROPWIDTH]);
+      debug.printf("\n");
+    }
+    */
+    debug.printf("    ORQ entries 0-15:\n"); 
+    for (int i = 0; i < 16; i+=2) {
+      debug.printf("      ORQ_%d[val=%d addr=%d bitVec=%o]  ORQ_%d[val=%d addr=%d bitVec=%o]\n",
+        i, orqVal[i], orqAddr[i], orqBitVec[i], i+1, orqVal[i+1], orqAddr[i+1], orqBitVec[i+1]);
+    }
+    debug.printf("    oArray :\n");
+    for (int i = 0; i < 2; i++) {
+      debug.printf("    ");
+      for (int j = arSize-1; j >= 0; j--) {
+        debug.printf("%x ", oArray[i][j]); 
+      }
+      debug.printf("\n");
+    }
+    /*
+    debug.printf("\n");
+    debug.printf("    ");
+    for (int i = GC.PROPPERPKT-1; i >= 0; i--) 
+      debug.printf("%d ", wrBufData[15][(i+1)*GC.PROPWIDTH-1:i*GC.PROPWIDTH]);
+    debug.printf("\n");
+    */
+  }
+}

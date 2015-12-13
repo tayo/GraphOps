@@ -1,0 +1,230 @@
+package pagerank;
+
+import com.maxeler.maxcompiler.v2.build.EngineParameters;
+import com.maxeler.maxcompiler.v2.managers.BuildConfig;
+import com.maxeler.maxcompiler.v2.managers.BuildConfig.Level;
+import com.maxeler.maxcompiler.v2.managers.custom.CustomManager;
+import com.maxeler.maxcompiler.v2.managers.custom.DFELink;
+import com.maxeler.maxcompiler.v2.managers.custom.blocks.KernelBlock;
+import com.maxeler.maxcompiler.v2.managers.custom.stdlib.*;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.*;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.EngineInterface.*;
+import com.maxeler.maxcompiler.v2.managers.custom.ManagerClock;
+
+import pagerank.kernels.*;
+
+
+class PagerankManager extends CustomManager {
+
+	private static final CPUTypes TYPE32 = CPUTypes.UINT32;
+	private static final CPUTypes TYPE64 = CPUTypes.UINT64;
+  private static final CPUTypes FLOAT  = CPUTypes.FLOAT;
+
+  PagerankManager(EngineParameters params) {
+    super(params);
+
+    ManagerClock clk = generateStreamClock("clk", 150);
+    pushDefaultClock(clk);
+
+    //config
+    config.setDefaultStreamClockFrequency(150);
+    config.setOnCardMemoryFrequency(LMemFrequency.MAX3_400); //timing.333__400
+    config.setEnableAddressGeneratorsInSlowClock(true);
+    
+    //debug
+    DebugLevel myDL = new DebugLevel();
+    myDL.setHasStreamStatus(false);  //timing?
+    debug.setDebugLevel(myDL);
+    
+    //mem ctrl
+    MemoryControllerConfig mem_cfg = new MemoryControllerConfig();
+    mem_cfg.setBurstSize(4); //MAX3: 4 = 4*384 bits, 8 = 8*384 bits
+    mem_cfg.setDataReadFIFOExtraPipelineRegInFabric(true);
+    mem_cfg.setDataFIFOExtraPipelineRegInFabric(true); //timing-23may
+    //mem_cfg.setDataFIFOPrimitiveWidth(5*72);
+    config.setMemoryControllerConfig(mem_cfg);
+    ////////////////////////////////////////////////////////
+
+    // BFS Kernels
+    //KernelBlock bvcRdr0  = addKernel(new BVCReader(makeKernelParameters("BVCReader0")));
+    KernelBlock FAPRdr0  = addKernel(new ForAllPropRdr(makeKernelParameters("ForAllPropRdr0")));
+    KernelBlock nbrRed0  = addKernel(new NbrPropRed(makeKernelParameters("NbrPropRed0")));
+    KernelBlock elemUpd0 = addKernel(new ElemUpdate(makeKernelParameters("ElemUpd0")));
+    //KernelBlock bvnWr0   = addKernel(new BVNWriter(makeKernelParameters("BVNWriter0")));
+    KernelBlock endSig0  = addKernel(new EndSignal(makeKernelParameters("EndSignal0")));
+    // MemUnits
+    KernelBlock memUnit0 = addKernel(new MemUnit(makeKernelParameters("MemUnit0")));
+    KernelBlock memUnit1 = addKernel(new MemUnit(makeKernelParameters("MemUnit1")));
+    KernelBlock memUnit2 = addKernel(new MemUnit(makeKernelParameters("MemUnit2")));
+    KernelBlock memUnit3 = addKernel(new MemUnit(makeKernelParameters("MemUnit3")));
+    KernelBlock memUnit4 = addKernel(new MemUnit(makeKernelParameters("MemUnit4")));
+
+    // Connect FAPReader and Reducer kernels
+    nbrRed0.getInput("repPtrData")   <== FAPRdr0.getOutput("repPtrData");
+
+    // Feedback: flow control
+    FAPRdr0.getInput("outputStall")    <== nbrRed0.getOutput("stall");
+
+    // Connect NbrReducer and ElemUpdate kernels 
+    elemUpd0.getInput("parentResult")  <== nbrRed0.getOutput("parentResult");
+
+    // Feedback: flow control
+    nbrRed0.getInput("outputStall")    <== elemUpd0.getOutput("stall");
+
+    // Connect all Idle/Done signals to BVNWriter
+    endSig0.getInput("edgeRdrIdle")  <== FAPRdr0.getOutput("idle");
+    endSig0.getInput("lvlRdrIdle")   <== nbrRed0.getOutput("nbrRedIdle");
+    endSig0.getInput("lvlUpdIdle")   <== elemUpd0.getOutput("lvlUpdIdle");
+
+    memUnit0.getInput("memReq") <== FAPRdr0.getOutput("memReq");  // read node array
+    memUnit1.getInput("memReq") <== FAPRdr0.getOutput("memReqRep"); // repl prop array
+    memUnit2.getInput("memReq") <== elemUpd0.getOutput("memReqRd");
+    memUnit3.getInput("memReq") <== elemUpd0.getOutput("memReqWr");
+    memUnit4.getInput("memReq") <== endSig0.getOutput("memReq");      // endSignal request
+
+
+    //////////////////////////////////
+    // Set up memory <--> DFE MemUnits
+    FAPRdr0.getInput("nodeArray") <==
+    addStreamFromOnCardMemory("lmemToDfe0", memUnit0.getOutput("cmd"));
+
+    nbrRed0.getInput("propArray") <==
+    addStreamFromOnCardMemory("lmemToDfe1", memUnit1.getOutput("cmd"));
+    
+    elemUpd0.getInput("propArray") <==
+    addStreamFromOnCardMemory("lmemToDfe2", memUnit2.getOutput("cmd"));
+
+    addStreamToOnCardMemory("dfeToLmem0", memUnit3.getOutput("cmd")) <==
+              elemUpd0.getOutput("propArrayMod");
+
+    endSig0.getInput("dummyArray") <==
+    addStreamFromOnCardMemory("lmemToDfe3", memUnit4.getOutput("cmd"));
+
+    /////////////////////////
+    // memory<-->host streams
+    DFELink fromcpu = addStreamFromCPU("fromcpu");
+    DFELink tocpu = addStreamToCPU("tocpu");
+    DFELink tolmem = addStreamToOnCardMemory("tolmem",
+      MemoryControlGroup.MemoryAccessPattern.LINEAR_1D);
+    DFELink fromlmem = addStreamFromOnCardMemory("fromlmem",
+      MemoryControlGroup.MemoryAccessPattern.LINEAR_1D);
+		tolmem <== fromcpu;
+		tocpu  <== fromlmem;
+  }
+
+  static EngineInterface interfaceWrite(String name) {
+		EngineInterface ei = new EngineInterface(name);
+
+		InterfaceParam size  = ei.addParam("size", TYPE64);
+		InterfaceParam start = ei.addParam("start", TYPE64);
+		InterfaceParam sizeInBytes = size * TYPE32.sizeInBytes();
+
+    // Disable memory control units, via scalar switches
+    ei.setScalar("MemUnit0", "en", 0);
+    ei.setScalar("MemUnit1", "en", 0);
+    ei.setScalar("MemUnit2", "en", 0);
+    ei.setScalar("MemUnit3", "en", 0);
+    ei.setScalar("MemUnit4", "en", 0);
+
+		ei.setStream("fromcpu", TYPE32, sizeInBytes );
+		ei.setLMemLinear("tolmem", start * TYPE32.sizeInBytes(), sizeInBytes);
+		ei.ignoreAll(Direction.IN_OUT);
+		return ei;
+  }
+
+  static EngineInterface interfaceRead(String name) {
+		EngineInterface ei = new EngineInterface(name);
+
+		InterfaceParam size  = ei.addParam("size", TYPE64);
+		InterfaceParam start = ei.addParam("start", TYPE64);
+		InterfaceParam sizeInBytes = size * TYPE32.sizeInBytes();
+
+    // Disable memory control units, via scalar switches
+    ei.setScalar("MemUnit0", "en", 0);
+    ei.setScalar("MemUnit1", "en", 0);
+    ei.setScalar("MemUnit2", "en", 0);
+    ei.setScalar("MemUnit3", "en", 0);
+    ei.setScalar("MemUnit4", "en", 0);
+
+		ei.setLMemLinear("fromlmem", start * TYPE32.sizeInBytes(), sizeInBytes);
+		ei.setStream("tocpu", TYPE32, sizeInBytes);
+		ei.ignoreAll(Direction.IN_OUT);
+		return ei;
+  }
+
+  static EngineInterface interfaceDefault() {
+    EngineInterface ei = new EngineInterface();
+
+    // Enable memory control units, via scalar switches
+    ei.setScalar("MemUnit0", "en", 1);
+    ei.setScalar("MemUnit1", "en", 1);
+    ei.setScalar("MemUnit2", "en", 1);
+    ei.setScalar("MemUnit3", "en", 1);
+    ei.setScalar("MemUnit4", "en", 1);
+
+    // Make scalar outputs visible
+    //EdgeRdr
+    //ei.unignoreScalar("EdgeRdr0", "scalarOut_0");
+    //ei.unignoreScalar("EdgeRdr0", "EdgeReaderCtrl.scal0");
+    //PropRdr
+    //ei.unignoreScalar("PropRdr0", "scalarOut_0");
+    //ei.unignoreScalar("PropRdr0", "PropReaderCtrl.scal0");
+    //PropRed
+    //ei.unignoreScalar("PropRed0"   , "CoalesceSM.orqRdPtr");
+    //ei.unignoreScalar("PropRed0"   , "scalarOut_0");
+    //BVC
+    //ei.unignoreScalar("BVCReader0", "scalarOut_0");
+
+    ei.unignoreScalar("MemUnit0", "numBrsts");
+    ei.unignoreScalar("MemUnit1", "numBrsts");
+    ei.unignoreScalar("MemUnit2", "numBrsts");
+    ei.unignoreScalar("MemUnit3", "numBrsts");
+    ei.unignoreScalar("MemUnit4", "numBrsts");
+
+    //InterfaceParam nN = ei.addParam("numNodes", TYPE32); 
+    InterfaceParam StartCnt = ei.addParam("StartCnt", TYPE64); 
+    InterfaceParam StopCnt  = ei.addParam("StopCnt" , TYPE64); 
+    InterfaceParam uDVal    = ei.addParam("uDVal"   , TYPE32); 
+    InterfaceParam nodeAddr = ei.addParam("nodeAddr", TYPE32); 
+    InterfaceParam repAddr  = ei.addParam("repAddr" , TYPE32); 
+    InterfaceParam propAddr = ei.addParam("propAddr", TYPE32); 
+    InterfaceParam NumNodes = ei.addParam("NumNodes", TYPE32);
+    InterfaceParam prTerm   = ei.addParam("prTerm"  , FLOAT);
+    InterfaceParam d        = ei.addParam("d"       , FLOAT);
+    ei.setScalar("ForAllPropRdr0", "uDVal"   , uDVal);
+    ei.setScalar("ForAllPropRdr0", "StartCnt", StartCnt);
+    ei.setScalar("ForAllPropRdr0", "nodeAddr", nodeAddr);
+    ei.setScalar("ForAllPropRdr0", "repAddr" , repAddr );
+    ei.setScalar("ForAllPropRdr0", "NumNodes", NumNodes);
+    ei.setScalar("NbrPropRed0", "uDVal"    , uDVal   );
+    ei.setScalar("NbrPropRed0", "prTerm"   , prTerm  );
+    ei.setScalar("NbrPropRed0", "d"        , d       );
+    ei.setScalar("ElemUpd0"    , "propAddr" , propAddr);
+    ei.setScalar("ElemUpd0"    , "uDVal"    , uDVal   );
+    ei.setScalar("EndSignal0" , "StopCnt"  , StopCnt );
+    ei.setScalar("EndSignal0" , "uDVal"    , uDVal   );
+
+    ei.ignoreAll(Direction.IN_OUT);
+
+    // interrupt to end execution
+    ei.setLMemInterruptOn("lmemToDfe3");
+    return ei; 
+  }
+
+  public static void main(String[] args) {
+    EngineParameters params = new EngineParameters(args);
+    PagerankManager m = new PagerankManager(params);
+    m.createSLiCinterface(interfaceDefault());
+    m.createSLiCinterface(interfaceRead("readLMem"));
+    m.createSLiCinterface(interfaceWrite("writeLMem")); 
+
+    // FULL_BUILD, MAP, PAR, SYNTHESIS
+    BuildConfig c = new BuildConfig(Level.FULL_BUILD); 
+    c.setEnableTimingAnalysis(true);
+    c.setMPPRCostTableSearchRange(1,4); 
+    c.setMPPRParallelism(4);
+		m.setBuildConfig(c);
+
+    m.build();
+  }
+}
